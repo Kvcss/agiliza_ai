@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewClicked|typeViewScrolled"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:packageNames="br.com.ionsistemas.ionvendas"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:isAccessibilityTool="false"
+    android:notificationTimeout="150"
+    android:description="@string/accessibility_service_description"
+    android:settingsActivity="com.agilizaai.cotacao.MainActivity" />

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agiliza Cotação</string>
+    <string name="accessibility_service_label">Captura assistida do Ion Vendas</string>
+    <string name="accessibility_service_description">Quando você tocar em Escanear, lê somente a tela visível do Ion Vendas e rola a tabela para montar sua cotação. Nada é enviado para servidores do Agiliza.</string>
+</resources>
+

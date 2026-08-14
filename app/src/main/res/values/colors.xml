@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="navy">#10233F</color>
+    <color name="navy_dark">#09162A</color>
+    <color name="blue">#2563EB</color>
+    <color name="blue_soft">#E8F0FF</color>
+    <color name="green">#12805C</color>
+    <color name="green_soft">#E4F7F0</color>
+    <color name="amber">#B45309</color>
+    <color name="amber_soft">#FFF4D6</color>
+    <color name="surface">#F1F5F9</color>
+    <color name="card">#FFFFFFFF</color>
+    <color name="ink">#172033</color>
+    <color name="muted">#667085</color>
+    <color name="line">#DDE3EC</color>
+</resources>

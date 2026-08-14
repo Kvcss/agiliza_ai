@@ -14,7 +14,7 @@ Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, g
 - Sobreposição com prazo atual, quantidade lida, total de produtos e comandos de pausar/fechar. Ela só existe durante uma sessão de captura e é removida ao concluir, cancelar ou fechar o Agiliza.
 - Exportação `.xlsx` com as abas `Cotação`, `Pendências` e `Metadados`.
 - Colunas com os preços efetivamente lidos em 7, 14, 21 e 28 dias.
-- Modalidade **Preencher modelo Excel por caixa**: preserva o arquivo original, localiza a coluna do fornecedor, cruza nomes de forma conservadora e grava `preço unitário × unidades da caixa`. Produtos não encontrados ou ambíguos ficam sem preenchimento.
+- Modalidade **Preencher modelo Excel por caixa**: preserva o arquivo original, localiza a coluna fixa da Vila Nova (`VILA`/`VILA NOVA`), cruza nomes de forma conservadora e grava `preço unitário × unidades da caixa`. Produtos não encontrados ou ambíguos ficam sem preenchimento.
 - Portal HTTPS dentro de WebView restrito ao domínio/porta configurados.
 - Credenciais cifradas com AES-GCM e chave armazenada no Android Keystore.
 - Preenchimento por correspondência de EAN com revisão e envio final manuais.
@@ -23,12 +23,12 @@ Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, g
 
 1. Instale o APK e abra **Agiliza Cotação**.
 2. Toque em **Configurar permissão de captura**, leia o aviso e habilite o serviço.
-3. Escolha o prazo que será usado no portal/modelo Excel e informe o nome exato da coluna do fornecedor (por exemplo, `Spani`).
+3. Em cada modalidade, escolha qual base capturada será usada: **7, 14, 21 ou 28 dias**. O fornecedor do modelo Excel é fixo como **Vila Nova**.
 4. Toque em **Abrir Ion e capturar**.
 5. No ION, siga: **Clientes > qualquer cliente > carrinho > Novo Pedido** e permaneça na aba **Cabeçalho**.
 6. Na sobreposição do Agiliza, toque em **Capturar 4 prazos** e aguarde. Não interaja com o ION durante a execução.
 7. Volte ao Agiliza, revise as linhas e exporte o Excel.
-8. Para a nova modalidade, toque em **Selecionar Excel da cotação** e depois em **Gerar Excel preenchido**.s
+8. Para a nova modalidade, toque em **Selecionar Excel da cotação** e depois em **Gerar Excel preenchido**.
 9. Para o portal, informe o link HTTPS e os seletores CSS do portal real. Abra, entre e toque em **Preencher**; revise antes de enviar.
 
 ## Compilar

@@ -11,8 +11,8 @@ android {
         applicationId = "com.agilizaai.cotacao"
         minSdk = 28
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.6.1"
+        versionCode = 12
+        versionName = "0.6.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

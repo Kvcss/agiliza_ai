@@ -34,7 +34,15 @@ class XlsxExporterTest {
                         14 to "1243.20",
                         21 to "1251.84",
                         28 to "1260.49"
-                    )
+                    ),
+                    stock = "164",
+                    casePricesByDays = mapOf(
+                        7 to "1234.56",
+                        14 to "1243.20",
+                        21 to "1251.84",
+                        28 to "1260.49"
+                    ),
+                    salesUnit = "CX"
                 )
             ),
             exportedAt = 1_700_000_000_000L
@@ -82,7 +90,9 @@ class XlsxExporterTest {
                     quantity = "1",
                     unitPrice = "10.000",
                     rawCells = emptyList(),
-                    pricesByDays = mapOf(7 to "10.000")
+                    pricesByDays = mapOf(7 to "10.000"),
+                    stock = "3",
+                    casePricesByDays = mapOf(7 to "10.000")
                 )
             ),
             supplierName = "Vila Nova"
@@ -123,7 +133,10 @@ class XlsxExporterTest {
             unitPrice = "20.000",
             rawCells = emptyList(),
             pricesByDays = mapOf(7 to "19.000", 14 to "20.000", 21 to "21.000"),
-            unitsPerCase = "4"
+            unitsPerCase = "4",
+            stock = "10",
+            casePricesByDays = mapOf(7 to "76.000", 14 to "80.000", 21 to "84.000"),
+            salesUnit = "CX"
         )
         XlsxExporter.write(
             output = output,
@@ -134,12 +147,14 @@ class XlsxExporterTest {
                     description = "Produto caixa 12",
                     packaging = "FD",
                     unitsPerCase = "12",
-                    pricesByDays = mapOf(7 to "54.000", 14 to "56.000", 21 to "58.000")
+                    pricesByDays = mapOf(7 to "54.000", 14 to "56.000", 21 to "58.000"),
+                    casePricesByDays = mapOf(7 to "648.000", 14 to "672.000", 21 to "696.000")
                 ),
                 common.copy(
                     id = "only-seven",
                     description = "Produto sem preço de 14 dias",
-                    pricesByDays = mapOf(7 to "30.000")
+                    pricesByDays = mapOf(7 to "30.000"),
+                    casePricesByDays = mapOf(7 to "120.000")
                 )
             ),
             conditionDays = 14
@@ -168,5 +183,67 @@ class XlsxExporterTest {
         assertTrue(table.contains("<v>12</v>"))
         assertEquals(2, "11-111-2".toRegex(RegexOption.LITERAL).findAll(table).count())
         assertFalse(pending.contains("7/21/28 dias"))
+    }
+
+    @Test
+    fun exportsClearStockColumnAndRejectsLowOrUnknownStock() {
+        val output = ByteArrayOutputStream()
+        fun item(id: String, stock: String) = QuoteItem(
+            id = id,
+            capturedAt = 1L,
+            conditionDays = 7,
+            sourcePackage = "ion",
+            productCode = id,
+            barcode = "7891234567890",
+            description = "Produto $id",
+            quantity = "6",
+            unitPrice = "34.206",
+            rawCells = emptyList(),
+            pricesByDays = mapOf(7 to "34.206"),
+            unitsPerCase = "6",
+            stock = stock,
+            casePricesByDays = mapOf(7 to "34.206"),
+            salesUnit = "CJ"
+        )
+        XlsxExporter.write(
+            output = output,
+            items = listOf(
+                item("estoque-tres", "3"),
+                item("estoque-alto", "2710"),
+                item("estoque-baixo", "2.99"),
+                item("estoque-ausente", ""),
+                item("estoque-ilegivel", "n/d")
+            ),
+            conditionDays = 7
+        )
+
+        var table = ""
+        var metadata = ""
+        ZipInputStream(ByteArrayInputStream(output.toByteArray())).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                when (entry.name) {
+                    "xl/worksheets/sheet1.xml" -> table = zip.readBytes().toString(Charsets.UTF_8)
+                    "xl/worksheets/sheet3.xml" -> metadata = zip.readBytes().toString(Charsets.UTF_8)
+                }
+            }
+        }
+
+        assertTrue(table.contains(">Estoque<"))
+        assertTrue(table.contains("Preço por caixa – 7 dias"))
+        assertTrue(table.contains("Unidade de venda"))
+        assertTrue(table.contains("Unidades por caixa"))
+        assertTrue(table.contains("Código do produto"))
+        assertFalse(table.contains(">Embalagem<"))
+        assertFalse(table.contains(">Qtd caixa<"))
+        assertTrue(table.contains("<v>34.206</v>"))
+        assertFalse(table.contains("<v>205.236</v>"))
+        assertTrue(table.contains("Produto estoque-tres"))
+        assertTrue(table.contains("Produto estoque-alto"))
+        assertFalse(table.contains("Produto estoque-baixo"))
+        assertFalse(table.contains("Produto estoque-ausente"))
+        assertFalse(table.contains("Produto estoque-ilegivel"))
+        assertTrue(metadata.contains("maior ou igual a 3"))
+        assertTrue(metadata.contains("ausente/ilegível"))
     }
 }

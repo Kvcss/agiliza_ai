@@ -32,9 +32,11 @@ class IonProductReaderTest {
         )!!
 
         assertEquals("7898924235997", detail.barcode)
-        assertEquals("59.700", detail.priceForDays(14))
-        assertEquals("1", detail.unitsPerCase)
+        assertEquals("59.7", detail.priceForDays(14))
         assertEquals("59.700", detail.casePriceForDays(14)!!.toPlainString())
+        assertEquals("1", detail.unitsPerCase)
+        assertEquals("164", detail.stock)
+        assertTrue(detail.hasMinimumStock())
         assertTrue(detail.rawCells.any { it.contains("Cx Unit/Tot") })
     }
 
@@ -165,6 +167,69 @@ class IonProductReaderTest {
 
         assertTrue(truncated.isCompatibleWith(full))
         assertTrue(!truncated.isCompatibleWith(otherCase))
+    }
+
+    @Test
+    fun detailStockOverridesListAndIsNormalizedForThreshold() {
+        val product = IonProductReader.readList(
+            listOf(
+                node("120.561", "textViewCodigoProduto", 100),
+                node("ACHOC NESCAU PO 200G", "textViewDescricao", 110),
+                node("17891000379585", "textViewCodigoBarras", 130),
+                node("6", "textViewEmbalagem", 150),
+                node("5,701", "textViewPrecoTabela", 170),
+                node("2.710,00", "textViewEstoque", 150)
+            )
+        ).single()
+
+        fun detail(stock: String) = IonProductReader.readDetail(
+            nodes = listOf(
+                node("120.561", "textViewCodigoProduto", 80),
+                node("ACHOC NESCAU PO 200G", "textViewProduto", 100),
+                node("6,000/24,000", "textViewQtUnitCX", 180),
+                node("34,206", "textViewProdutoPrecoTabela", 180),
+                node(stock, "textViewProdutoEstoque", 200)
+            ),
+            listProduct = product,
+            conditionDays = 7,
+            sourcePackage = "ion"
+        )!!
+
+        assertEquals("2.5", detail("2,50").stock)
+        assertTrue(!detail("2,50").hasMinimumStock())
+        assertEquals("3", detail("3,00").stock)
+        assertTrue(detail("3,00").hasMinimumStock())
+        assertEquals("5.701", detail("3,00").priceForDays(7))
+        assertEquals("34.206", detail("3,00").casePriceForDays(7)?.toPlainString())
+    }
+
+    @Test
+    fun unitPriceUsesCaseDivisionAndListPriceOnlyAsFallback() {
+        fun product(packaging: String) = IonProductReader.readList(
+            listOf(
+                node("105.560", "textViewCodigoProduto", 100),
+                node("ABS ALWAYS NOITE 8UN SECA", "textViewDescricao", 110),
+                node("7890000000001", "textViewCodigoBarras", 130),
+                node(packaging, "textViewEmbalagem", 150),
+                node("12,43", "textViewPrecoTabela", 170),
+                node("20,00", "textViewEstoque", 150)
+            )
+        ).single()
+        fun detail(product: IonProductReader.ListProduct, caseText: String) = IonProductReader.readDetail(
+            nodes = listOf(
+                node("105.560", "textViewCodigoProduto", 80),
+                node("ABS ALWAYS NOITE 8UN SECA", "textViewProduto", 100),
+                node(caseText, "textViewQtUnitCX", 180),
+                node("43,22", "textViewProdutoPrecoTabela", 180),
+                node("20,00", "textViewProdutoEstoque", 200)
+            ),
+            listProduct = product,
+            conditionDays = 7,
+            sourcePackage = "ion"
+        )!!
+
+        assertEquals("7.203333", detail(product("6"), "6,000/6,000").priceForDays(7))
+        assertEquals("12.43", detail(product(""), "").priceForDays(7))
     }
 
     private fun node(text: String, id: String, y: Int) = NodeSnapshot(

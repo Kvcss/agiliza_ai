@@ -13,8 +13,10 @@ Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, g
 - Rolagem automática até o final de cada um dos quatro prazos, deduplicação e proteção contra captura interrompida/parcial.
 - Sobreposição com prazo atual, quantidade lida, total de produtos e comandos de pausar/fechar. Ela só existe durante uma sessão de captura e é removida ao concluir, cancelar ou fechar o Agiliza.
 - Exportação `.xlsx` com as abas `Cotação`, `Pendências` e `Metadados`.
-- Colunas com os preços efetivamente lidos em 7, 14, 21 e 28 dias.
-- Modalidade **Preencher modelo Excel por caixa**: preserva o arquivo original, localiza a coluna fixa da Vila Nova (`VILA`/`VILA NOVA`), cruza nomes de forma conservadora e grava `preço unitário × unidades da caixa`. Produtos não encontrados ou ambíguos ficam sem preenchimento.
+- Colunas identificadas com os preços por caixa efetivamente lidos em 7, 14, 21 e 28 dias, unidade de venda, unidades por caixa e estoque.
+- Somente produtos com estoque numérico maior ou igual a 3 entram na base; estoque menor, ausente ou ilegível é descartado.
+- Modalidade **Preencher modelo Excel por caixa**: preserva o arquivo original, renomeia exclusivamente o cabeçalho `nome` para `Vila`, cruza nomes de forma conservadora, prioriza a variante comercial `CJ` e grava o `Pço Tabela` diretamente, sem multiplicação adicional. Produtos não encontrados ou ambíguos ficam sem preenchimento.
+- O modelo escolhido é validado antes da geração. A tela confirma nome, tamanho, aba e célula do cabeçalho `nome`; uma cópia errada ou já preenchida é recusada sem tocar nas demais colunas.
 - Portal HTTPS dentro de WebView restrito ao domínio/porta configurados.
 - Credenciais cifradas com AES-GCM e chave armazenada no Android Keystore.
 - Preenchimento por correspondência de EAN com revisão e envio final manuais.
@@ -53,7 +55,8 @@ APK gerado em `app/build/outputs/apk/debug/app-debug.apk`.
 ## Segurança e integridade
 
 - O app não acessa o banco privado do Ion e não tenta contornar proteções do Android.
-- Capturas incompletas são bloqueadas para exportação e preenchimento.
+- Rascunhos parciais ficam protegidos e podem ser exportados; a última base útil continua disponível se a nova coleta ainda não tiver item elegível.
+- Arquivos XLSX são montados antes da gravação e salvos com truncamento explícito, evitando cauda de ZIP antiga ao substituir um documento existente.
 - Backup do aplicativo está desativado.
 - Nenhuma senha entra no Excel ou nos logs do aplicativo.
 - O envio final da cotação permanece sob confirmação do usuário.

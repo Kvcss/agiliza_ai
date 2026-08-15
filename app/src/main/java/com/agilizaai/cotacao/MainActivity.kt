@@ -32,8 +32,9 @@ import android.widget.Toast
 import com.agilizaai.cotacao.data.AppPreferences
 import com.agilizaai.cotacao.data.QuoteItem
 import com.agilizaai.cotacao.data.QuoteRepository
-import com.agilizaai.cotacao.export.XlsxExporter
+import com.agilizaai.cotacao.export.QuoteDocumentStreams
 import com.agilizaai.cotacao.export.QuoteWorkbookFiller
+import com.agilizaai.cotacao.export.XlsxExporter
 import com.agilizaai.cotacao.web.PortalConfigActivity
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -68,6 +69,10 @@ class MainActivity : Activity() {
     private var generatedQuoteName: String = ""
     private var generatedQuoteSummary: String = ""
     private var quoteIsProcessing = false
+    private var quoteIsValidating = false
+    private var quoteValidationName = ""
+    private var quoteValidationError = ""
+    private var selectedQuoteTemplateSummary = ""
     private var launchingIon = false
     private val lifecycleHandler = Handler(Looper.getMainLooper())
     private val stopIdleCapture = Runnable {
@@ -500,11 +505,21 @@ class MainActivity : Activity() {
         val excelConditionDays = preferences.excelConditionDays
         if (::excelConditionGroup.isInitialized) {
             for (index in 0 until excelConditionGroup.childCount) {
-                excelConditionGroup.getChildAt(index).isEnabled = !quoteIsProcessing
+                excelConditionGroup.getChildAt(index).isEnabled = !quoteIsProcessing && !quoteIsValidating
             }
         }
-        quoteSecondaryAction.visibility = if (selectedQuoteUri != null || generatedQuoteUri != null) View.VISIBLE else View.GONE
+        quoteSecondaryAction.visibility = if (!quoteIsValidating && (selectedQuoteUri != null || generatedQuoteUri != null)) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
         when {
+            quoteIsValidating -> {
+                styleQuoteStep("VALIDANDO O MODELO…", R.color.blue, R.color.blue_soft)
+                quoteFileLabel.text = "Conferindo $quoteValidationName\nProcurando o cabeçalho 'nome' e a lista de produtos."
+                fillQuoteButton.text = "VALIDANDO EXCEL…"
+                fillQuoteButton.isEnabled = false
+            }
             quoteIsProcessing -> {
                 styleQuoteStep("PREENCHENDO O ARQUIVO…", R.color.blue, R.color.blue_soft)
                 quoteFileLabel.text = "Processando ${selectedQuoteUri?.let(::displayName).orEmpty()}"
@@ -520,6 +535,13 @@ class MainActivity : Activity() {
                 fillQuoteButton.text = "COMPARTILHAR EXCEL PREENCHIDO"
                 fillQuoteButton.isEnabled = true
                 quoteSecondaryAction.text = "Usar outro arquivo da cotação"
+            }
+            quoteValidationError.isNotBlank() -> {
+                styleQuoteStep("ARQUIVO NÃO COMPATÍVEL", R.color.amber, R.color.amber_soft)
+                quoteFileLabel.text = quoteValidationError
+                fillQuoteButton.text = "SELECIONAR O MODELO ORIGINAL"
+                fillQuoteButton.isEnabled = true
+                quoteSecondaryAction.visibility = View.GONE
             }
             selectedQuoteUri == null -> {
                 styleQuoteStep("PASSO 1 DE 3 · ESCOLHA O MODELO", R.color.blue, R.color.blue_soft)
@@ -544,8 +566,14 @@ class MainActivity : Activity() {
             }
             else -> {
                 styleQuoteStep("PASSO 3 DE 3 · PRONTO PARA GERAR", R.color.green, R.color.green_soft)
-                quoteFileLabel.text =
-                    "Selecionado: ${displayName(selectedQuoteUri!!)}\nBase de dados: $excelConditionDays dias · fornecedor: $FIXED_SUPPLIER_NAME"
+                quoteFileLabel.text = buildString {
+                    append("Selecionado: ").append(documentDescription(selectedQuoteUri!!))
+                    if (selectedQuoteTemplateSummary.isNotBlank()) {
+                        append("\n").append(selectedQuoteTemplateSummary)
+                    }
+                    append("\nBase de dados: ").append(excelConditionDays)
+                        .append(" dias · fornecedor: ").append(FIXED_SUPPLIER_NAME)
+                }
                 fillQuoteButton.text = "GERAR EXCEL PREENCHIDO"
                 fillQuoteButton.isEnabled = true
                 quoteSecondaryAction.text = "Trocar arquivo da cotação"
@@ -562,6 +590,7 @@ class MainActivity : Activity() {
     private fun handleQuotePrimaryAction() {
         when {
             generatedQuoteUri != null -> shareGeneratedQuote()
+            quoteValidationError.isNotBlank() -> chooseQuoteFile()
             selectedQuoteUri == null -> chooseQuoteFile()
             else -> createFilledQuoteDocument()
         }
@@ -676,7 +705,7 @@ class MainActivity : Activity() {
         exportButtonFor(conditionDays).isEnabled = false
         Thread {
             val result = runCatching {
-                contentResolver.openOutputStream(uri, "w")?.use { output ->
+                contentResolver.openOutputStream(uri, QuoteDocumentStreams.TRUNCATING_OUTPUT_MODE)?.use { output ->
                     XlsxExporter.write(
                         output = output,
                         items = items,
@@ -722,12 +751,43 @@ class MainActivity : Activity() {
 
     private fun selectQuoteFile(uri: Uri, resultFlags: Int) {
         persistDocumentPermission(uri, resultFlags)
-        selectedQuoteUri = uri
         clearGeneratedQuote()
+        selectedQuoteUri = null
+        selectedQuoteTemplateSummary = ""
+        quoteValidationError = ""
+        quoteValidationName = documentDescription(uri)
+        quoteIsValidating = true
         excelWorkflowPreferences.edit()
-            .putString(KEY_SELECTED_QUOTE_URI, uri.toString())
+            .remove(KEY_SELECTED_QUOTE_URI)
+            .remove(KEY_SELECTED_QUOTE_SUMMARY)
             .apply()
         refreshState()
+        Thread {
+            val result = runCatching {
+                contentResolver.openInputStream(uri)?.use(QuoteWorkbookFiller::inspectTemplate)
+                    ?: error("Não foi possível abrir o arquivo selecionado")
+            }
+            runOnUiThread {
+                quoteIsValidating = false
+                result.onSuccess { template ->
+                    selectedQuoteUri = uri
+                    selectedQuoteTemplateSummary =
+                        "Modelo confirmado: ${template.targetSheet}!${template.headerCell} · coluna ${template.targetColumn}"
+                    excelWorkflowPreferences.edit()
+                        .putString(KEY_SELECTED_QUOTE_URI, uri.toString())
+                        .putString(KEY_SELECTED_QUOTE_SUMMARY, selectedQuoteTemplateSummary)
+                        .apply()
+                    refreshState()
+                }.onFailure { error ->
+                    quoteValidationError = buildString {
+                        append("Arquivo aberto: ").append(quoteValidationName).append("\n")
+                        append(error.message ?: "modelo incompatível").append("\n")
+                        append("Selecione o modelo original que possui 'nome' na coluna H.")
+                    }
+                    refreshState()
+                }
+            }
+        }.start()
     }
 
     private fun createFilledQuoteDocument() {
@@ -758,17 +818,18 @@ class MainActivity : Activity() {
         refreshExcelWorkflow(hasItems = items.isNotEmpty(), selectedTableReady = true)
         Thread {
             val result = runCatching {
-                contentResolver.openInputStream(inputUri)?.use { input ->
-                    contentResolver.openOutputStream(outputUri, "w")?.use { output ->
-                        QuoteWorkbookFiller.fill(
-                            input = input,
-                            output = output,
-                            items = items,
-                            conditionDays = excelConditionDays,
-                            supplierName = FIXED_SUPPLIER_NAME
-                        )
-                    } ?: error("Não foi possível criar o arquivo de saída")
-                } ?: error("Não foi possível abrir o modelo")
+                QuoteDocumentStreams.withSnapshot(
+                    openInput = { contentResolver.openInputStream(inputUri) },
+                    openOutput = { mode -> contentResolver.openOutputStream(outputUri, mode) }
+                ) { input, output ->
+                    QuoteWorkbookFiller.fill(
+                        input = input,
+                        output = output,
+                        items = items,
+                        conditionDays = excelConditionDays,
+                        supplierName = FIXED_SUPPLIER_NAME
+                    )
+                }
             }
             runOnUiThread {
                 quoteIsProcessing = false
@@ -787,7 +848,11 @@ class MainActivity : Activity() {
                     toast("Não foi possível preencher o Excel")
                     refreshState()
                     styleQuoteStep("NÃO FOI POSSÍVEL GERAR", R.color.amber, R.color.amber_soft)
-                    quoteFileLabel.text = "Falha: ${error.message ?: "modelo incompatível"}\nConfira o arquivo e tente novamente."
+                    quoteFileLabel.text = buildString {
+                        append("Falha em ").append(documentDescription(inputUri)).append(":\n")
+                        append(error.message ?: "modelo incompatível").append("\n")
+                        append("Confira o arquivo e tente novamente.")
+                    }
                 }
             }
         }.start()
@@ -841,12 +906,18 @@ class MainActivity : Activity() {
         val storedInput = excelWorkflowPreferences.getString(KEY_SELECTED_QUOTE_URI, null)?.let(Uri::parse)
         val storedOutput = excelWorkflowPreferences.getString(KEY_GENERATED_QUOTE_URI, null)?.let(Uri::parse)
         selectedQuoteUri = storedInput?.takeIf(::canReadDocument)
+        selectedQuoteTemplateSummary = excelWorkflowPreferences
+            .getString(KEY_SELECTED_QUOTE_SUMMARY, "")
+            .orEmpty()
         generatedQuoteUri = storedOutput?.takeIf(::canReadDocument)
         generatedQuoteName = excelWorkflowPreferences.getString(KEY_GENERATED_QUOTE_NAME, "").orEmpty()
         generatedQuoteSummary = excelWorkflowPreferences.getString(KEY_GENERATED_QUOTE_SUMMARY, "").orEmpty()
         if (selectedQuoteUri == null || (generatedQuoteUri == null && storedOutput != null)) {
             excelWorkflowPreferences.edit().apply {
-                if (selectedQuoteUri == null) remove(KEY_SELECTED_QUOTE_URI)
+                if (selectedQuoteUri == null) {
+                    remove(KEY_SELECTED_QUOTE_URI)
+                    remove(KEY_SELECTED_QUOTE_SUMMARY)
+                }
                 if (generatedQuoteUri == null) {
                     remove(KEY_GENERATED_QUOTE_URI)
                     remove(KEY_GENERATED_QUOTE_NAME)
@@ -876,6 +947,36 @@ class MainActivity : Activity() {
             if (cursor.moveToFirst()) cursor.getString(0) else null
         }
     }.getOrNull().orEmpty().ifBlank { uri.lastPathSegment ?: "cotação.xlsx" }
+
+    private fun documentDescription(uri: Uri): String {
+        var name = ""
+        var size: Long? = null
+        runCatching {
+            contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIndex >= 0 && !cursor.isNull(nameIndex)) name = cursor.getString(nameIndex).orEmpty()
+                    if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+                }
+            }
+        }
+        val resolvedName = name.ifBlank { displayName(uri) }
+        val resolvedSize = size?.takeIf { it >= 0L } ?: return resolvedName
+        return "$resolvedName · ${formatFileSize(resolvedSize)}"
+    }
+
+    private fun formatFileSize(bytes: Long): String = when {
+        bytes >= 1024L * 1024L -> String.format(Locale.forLanguageTag("pt-BR"), "%.2f MB", bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> String.format(Locale.forLanguageTag("pt-BR"), "%.1f KB", bytes / 1024.0)
+        else -> "$bytes B"
+    }
 
     private fun confirmClear() {
         if (repository.load().isEmpty()) return
@@ -1023,6 +1124,7 @@ class MainActivity : Activity() {
         private const val XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         private const val EXCEL_WORKFLOW_PREFERENCES = "excel_workflow"
         private const val KEY_SELECTED_QUOTE_URI = "selected_quote_uri"
+        private const val KEY_SELECTED_QUOTE_SUMMARY = "selected_quote_summary"
         private const val KEY_GENERATED_QUOTE_URI = "generated_quote_uri"
         private const val KEY_GENERATED_QUOTE_NAME = "generated_quote_name"
         private const val KEY_GENERATED_QUOTE_SUMMARY = "generated_quote_summary"

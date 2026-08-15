@@ -513,8 +513,16 @@ class IonCaptureService : AccessibilityService() {
             compatibleKey != null -> compatibleKey
             else -> exactKey
         }
-        capturedItems[key] = mergeProduct(capturedItems[key], item)
-        capturedIdentities[key] = capturedIdentities[key]?.mergedWith(identity) ?: identity
+        val eligibleStock = item.hasMinimumStock()
+        if (eligibleStock) {
+            capturedItems[key] = mergeProduct(capturedItems[key], item)
+            capturedIdentities[key] = capturedIdentities[key]?.mergedWith(identity) ?: identity
+        } else {
+            // If a later pass reveals insufficient/unknown stock, remove the variant from
+            // the protected draft too. Product-code duplicates remain independent by key.
+            capturedItems.remove(key)
+            capturedIdentities.remove(key)
+        }
         if (!persistCurrentDraft()) {
             abortCapture("Não consegui salvar o rascunho no aparelho", AppPreferences.CAPTURE_ABORTED)
             return
@@ -522,7 +530,12 @@ class IonCaptureService : AccessibilityService() {
         visitedInCondition += listProduct.stableKey
         currentProduct = null
         conditionCounts[currentDays()] = visitedInCondition.size
-        updateOverlay("${currentDays()} dias · produto gravado", progressText())
+        val stockStatus = if (eligibleStock) {
+            "produto gravado · estoque ${item.stock}"
+        } else {
+            "ignorado · estoque abaixo de 3 ou ilegível"
+        }
+        updateOverlay("${currentDays()} dias · $stockStatus", progressText())
 
         // The only exit from product detail is Android Back. Never click the green confirmation.
         if (performGlobalAction(GLOBAL_ACTION_BACK)) {
@@ -589,7 +602,11 @@ class IonCaptureService : AccessibilityService() {
             onSuccess = { "${items.size} produtos · 4 prazos concluídos" },
             onFailure = {
                 val reason = it.message ?: "Não foi possível finalizar a captura"
-                "$reason · rascunho automático mantido"
+                if (repository.hasDraft()) {
+                    "$reason · rascunho automático mantido"
+                } else {
+                    "$reason · última coleta válida mantida"
+                }
             }
         )
         preferences.captureStatus = if (result.isSuccess) AppPreferences.CAPTURE_COMPLETE else AppPreferences.CAPTURE_ABORTED
@@ -678,13 +695,17 @@ class IonCaptureService : AccessibilityService() {
     }
 
     private fun persistCurrentDraft(): Boolean {
-        if (capturedItems.isEmpty()) return true
         val snapshot = capturedItems.values.toList()
         return runCatching {
             repository.replaceDraft(snapshot)
-            preferences.lastCaptureSavedAt = System.currentTimeMillis()
-            preferences.lastCaptureSavedCount = snapshot.size
-            preferences.captureStatusMessage = "Rascunho protegido · ${snapshot.size} produtos"
+            if (snapshot.isNotEmpty()) {
+                preferences.lastCaptureSavedAt = System.currentTimeMillis()
+                preferences.lastCaptureSavedCount = snapshot.size
+                preferences.captureStatusMessage = "Rascunho protegido · ${snapshot.size} produtos"
+            } else {
+                preferences.captureStatusMessage =
+                    "Nenhum item elegível ainda · última coleta válida mantida"
+            }
         }.isSuccess
     }
 
@@ -710,7 +731,10 @@ class IonCaptureService : AccessibilityService() {
         if (current == null) return candidate
         fun choose(existing: String, incoming: String): String = existing.ifBlank { incoming }
         val mergedPrices = current.pricesByDays + candidate.pricesByDays
-        val primaryDays = if (7 in mergedPrices) 7 else mergedPrices.keys.minOrNull() ?: candidate.conditionDays
+        val mergedCasePrices = current.casePricesByDays + candidate.casePricesByDays
+        val primaryDays = if (7 in mergedCasePrices) 7 else {
+            mergedCasePrices.keys.minOrNull() ?: candidate.conditionDays
+        }
         return current.copy(
             capturedAt = maxOf(current.capturedAt, candidate.capturedAt),
             conditionDays = primaryDays,
@@ -722,7 +746,10 @@ class IonCaptureService : AccessibilityService() {
             unitPrice = mergedPrices[primaryDays].orEmpty(),
             rawCells = (current.rawCells + candidate.rawCells).distinct(),
             pricesByDays = mergedPrices,
-            unitsPerCase = choose(current.unitsPerCase, candidate.unitsPerCase)
+            unitsPerCase = choose(current.unitsPerCase, candidate.unitsPerCase),
+            stock = candidate.stock.ifBlank { current.stock },
+            casePricesByDays = mergedCasePrices,
+            salesUnit = choose(current.salesUnit, candidate.salesUnit)
         )
     }
 

@@ -19,6 +19,12 @@ import javax.xml.transform.stream.StreamResult
 
 /** Preserves the supplied XLSX package and changes only matched price cells. */
 object QuoteWorkbookFiller {
+    data class TemplateInfo(
+        val targetSheet: String,
+        val targetColumn: String,
+        val headerCell: String
+    )
+
     data class FillResult(
         val targetSheet: String,
         val targetColumn: String,
@@ -26,6 +32,10 @@ object QuoteWorkbookFiller {
         val unmatched: Int,
         val rowsRead: Int
     )
+
+    fun inspectTemplate(input: InputStream): TemplateInfo = locateTemplate(readZip(input))
+        .candidate
+        .toTemplateInfo()
 
     fun fill(
         input: InputStream,
@@ -36,24 +46,21 @@ object QuoteWorkbookFiller {
     ): FillResult {
         require(conditionDays in listOf(7, 14, 21, 28)) { "Prazo inválido" }
         require(items.isNotEmpty()) { "Não há tabela capturada" }
-        val entries = readZip(input)
-        val sharedStrings = parseSharedStrings(entries["xl/sharedStrings.xml"])
-        val sheets = workbookSheets(entries)
-        var candidate: Candidate? = null
-        for (sheet in sheets) {
-            val bytes = entries[sheet.path] ?: continue
-            val document = parseXml(bytes)
-            val target = findTarget(document, sharedStrings, sheet.name, supplierName) ?: continue
-            val found = Candidate(sheet, document, target)
-            val current = candidate
-            if (current == null || found.target.priority < current.target.priority ||
-                (found.target.priority == current.target.priority && found.target.rowsPotential > current.target.rowsPotential)
-            ) {
-                candidate = found
-            }
-            if (found.target.priority == 0) break
+        require(ProductNameMatcher.normalize(supplierName) == FIXED_SUPPLIER_NAME) {
+            "Esta modalidade preenche somente o fornecedor Vila Nova"
         }
-        val selected = candidate ?: error("Não encontrei a coluna '$supplierName' nem uma coluna VALOR CAIXA/CUSTO")
+        val entries = readZip(input)
+        val located = locateTemplate(entries)
+        val selected = located.candidate
+        val sharedStrings = located.sharedStrings
+        val priceStyles = entries[STYLES_PATH]?.let(::parsePriceStyles)
+
+        val headerCell = selected.document.elements("row")
+            .firstOrNull { it.attr("r").toIntOrNull() == selected.target.headerRow }
+            ?.cell(selected.target.priceColumn)
+            ?: error("A célula do cabeçalho 'nome' não está disponível")
+        headerCell.writeText(OUTPUT_HEADER)
+        val eligibleItems = items.filter(QuoteItem::hasMinimumStock)
 
         var matched = 0
         var unmatched = 0
@@ -66,20 +73,27 @@ object QuoteWorkbookFiller {
             val productName = readCell(nameCell, sharedStrings).trim()
             if (productName.length < 4 || productName.equals("Z", true)) return@forEach
             rowsRead++
-            val expectedUnits = readExpectedUnits(row, selected.target.caseColumn, sharedStrings)
-            val match = ProductNameMatcher.find(productName, items, expectedUnits)
+            val match = ProductNameMatcher.find(
+                productName = productName,
+                items = eligibleItems,
+                variantPolicy = ProductNameMatcher.VariantPolicy.PREFER_SINGLE_CJ
+            )
             val price = match?.item?.casePriceForDays(conditionDays)
             if (price == null) {
                 unmatched++
                 return@forEach
             }
             val targetCell = row.getOrCreateCell(selected.target.priceColumn, rowNumber, selected.document)
+            priceStyles?.let { styles ->
+                targetCell.setAttribute("s", styles.threeDecimalStyle(targetCell.attr("s")).toString())
+            }
             targetCell.writeNumber(price.stripTrailingZeros().toPlainString())
             matched++
         }
 
         check(rowsRead > 0) { "A planilha não possui produtos abaixo do cabeçalho" }
         entries[selected.sheet.path] = xmlBytes(selected.document)
+        if (priceStyles?.changed == true) entries[STYLES_PATH] = xmlBytes(priceStyles.document)
         writeZip(entries, output)
         return FillResult(
             targetSheet = selected.sheet.name,
@@ -95,111 +109,96 @@ object QuoteWorkbookFiller {
         val headerRow: Int,
         val productColumn: Int,
         val priceColumn: Int,
-        val caseColumn: Int?,
         val priority: Int,
         val rowsPotential: Int
     )
     private data class Candidate(val sheet: WorkbookSheet, val document: Document, val target: Target)
+    private data class LocatedTemplate(val candidate: Candidate, val sharedStrings: List<String>)
+    private data class TargetSearch(val target: Target?, val exactHeaderFound: Boolean)
+    private data class CellText(val column: Int, val normalized: String)
+    private data class PriceStyles(
+        val document: Document,
+        val cellXfs: Element,
+        val numberFormatId: String,
+        val cache: MutableMap<Int, Int> = mutableMapOf(),
+        var changed: Boolean = false
+    )
+
+    private fun locateTemplate(entries: Map<String, ByteArray>): LocatedTemplate {
+        val sharedStrings = parseSharedStrings(entries["xl/sharedStrings.xml"])
+        var candidate: Candidate? = null
+        var exactHeaderFound = false
+        for (sheet in workbookSheets(entries)) {
+            val bytes = entries[sheet.path] ?: continue
+            val document = parseXml(bytes)
+            val search = findTarget(document, sharedStrings, sheet.name)
+            exactHeaderFound = exactHeaderFound || search.exactHeaderFound
+            val target = search.target ?: continue
+            val found = Candidate(sheet, document, target)
+            val current = candidate
+            if (current == null || found.target.priority < current.target.priority ||
+                (found.target.priority == current.target.priority && found.target.rowsPotential > current.target.rowsPotential)
+            ) {
+                candidate = found
+            }
+            if (found.target.priority == 0) break
+        }
+        val selected = candidate ?: if (exactHeaderFound) {
+            error("Encontrei o cabeçalho exato 'nome', mas não consegui identificar a coluna com os nomes dos produtos")
+        } else {
+            error("Não encontrei o cabeçalho exato 'nome' na aba de cotação")
+        }
+        return LocatedTemplate(selected, sharedStrings)
+    }
+
+    private fun Candidate.toTemplateInfo() = TemplateInfo(
+        targetSheet = sheet.name,
+        targetColumn = columnName(target.priceColumn),
+        headerCell = "${columnName(target.priceColumn)}${target.headerRow}"
+    )
 
     private fun findTarget(
         document: Document,
         sharedStrings: List<String>,
-        sheetName: String,
-        supplierName: String
-    ): Target? {
+        sheetName: String
+    ): TargetSearch {
         val rows = document.elements("row")
-        val supplier = ProductNameMatcher.normalize(supplierName)
-        val acceptedSupplierNames = acceptedSupplierNames(supplier)
         var best: Target? = null
+        var exactHeaderFound = false
         rows.forEach { row ->
             val rowNumber = row.attr("r").toIntOrNull() ?: return@forEach
             val values = row.childElements("c").mapNotNull { cell ->
                 val column = cell.attr("r").takeWhile(Char::isLetter).columnNumberOrNull() ?: return@mapNotNull null
-                column to ProductNameMatcher.normalize(readCell(cell, sharedStrings))
-            }.filter { it.second.isNotBlank() }
+                val raw = readCell(cell, sharedStrings).trim()
+                CellText(column, ProductNameMatcher.normalize(raw))
+            }.filter { it.normalized.isNotBlank() }
             if (values.isEmpty()) return@forEach
 
-            // Prefer the official name when both headers happen to exist. Vila Nova's
-            // quotation model abbreviates its own column to exactly "VILA"; no other
-            // partial/prefix matching is allowed here.
-            val supplierColumn = values.firstOrNull { (_, text) -> text == supplier }?.first
-                ?: values.firstOrNull { (_, text) -> text in acceptedSupplierNames }?.first
-            val caseColumn = values.firstOrNull { (_, text) -> isCaseQuantityHeader(text) }?.first
-            if (supplierColumn != null) {
+            // The client workbook reserves the exact header "nome" for this supplier.
+            // Existing supplier columns (including a pre-existing VILA column) belong
+            // to other quotations and must never be selected or modified.
+            val supplierHeader = values.firstOrNull { it.normalized == INPUT_HEADER }
+            if (supplierHeader != null) {
+                exactHeaderFound = true
                 val productColumn = findProductColumn(document, sharedStrings, rowNumber, preferred = 2)
                 if (productColumn != null) {
                     val potential = rows.count { it.attr("r").toIntOrNull()?.let { number -> number > rowNumber } == true }
                     val target = Target(
                         rowNumber,
                         productColumn,
-                        supplierColumn,
-                        caseColumn,
-                        priority = 0,
+                        supplierHeader.column,
+                        priority = if (ProductNameMatcher.normalize(sheetName).contains("COTACAO")) 0 else 1,
                         rowsPotential = potential
                     )
-                    if (best == null || target.rowsPotential > best!!.rowsPotential) best = target
+                    if (best == null || target.priority < best!!.priority ||
+                        (target.priority == best!!.priority && target.rowsPotential > best!!.rowsPotential)
+                    ) {
+                        best = target
+                    }
                 }
             }
-
-            val productHeader = values.firstOrNull { (_, text) ->
-                text == "PRODUTO" || text.contains("DESCRICAO") || text == "ITEM"
-            }?.first
-            val priceHeader = values.firstOrNull { (_, text) ->
-                text.contains("VALOR CAIXA") || text == "CUSTO" || text.contains("PRECO CAIXA")
-            }?.first
-            if (productHeader != null && priceHeader != null) {
-                val sheetMatches = ProductNameMatcher.normalize(sheetName) in acceptedSupplierNames
-                val target = Target(
-                    rowNumber,
-                    productHeader,
-                    priceHeader,
-                    caseColumn,
-                    priority = if (sheetMatches) 1 else 2,
-                    rowsPotential = 0
-                )
-                if (best == null || target.priority < best!!.priority) best = target
-            }
         }
-        return best
-    }
-
-    private fun acceptedSupplierNames(normalizedSupplier: String): Set<String> =
-        if (normalizedSupplier == "VILA NOVA") setOf("VILA NOVA", "VILA")
-        else setOf(normalizedSupplier)
-
-    private fun isCaseQuantityHeader(text: String): Boolean =
-        text == "CX" ||
-            text == "CX C" ||
-            text.startsWith("CX C ") ||
-            text == "QTD CX" ||
-            text == "QTDE CX" ||
-            text.contains("QTD CAIXA") ||
-            text.contains("QTDE CAIXA")
-
-    private fun readExpectedUnits(
-        row: Element,
-        caseColumn: Int?,
-        sharedStrings: List<String>
-    ): String? {
-        if (caseColumn != null) {
-            return row.cell(caseColumn)
-                ?.let { readCell(it, sharedStrings).trim() }
-                ?.takeIf { ProductNameMatcher.parseUnits(it) != null }
-        }
-
-        // Some quotation models repeat "CX C/" in every product row and put
-        // the actual quantity in the immediately adjacent cell (for example D/E).
-        // Accept exactly one distinct valid quantity; conflicting labels are ambiguous.
-        val quantities = row.childElements("c").mapNotNull { labelCell ->
-            val label = ProductNameMatcher.normalize(readCell(labelCell, sharedStrings))
-            if (!isCaseQuantityHeader(label)) return@mapNotNull null
-            val labelColumn = labelCell.attr("r").takeWhile(Char::isLetter).columnNumberOrNull()
-                ?: return@mapNotNull null
-            row.cell(labelColumn + 1)
-                ?.let { readCell(it, sharedStrings).trim() }
-                ?.takeIf { ProductNameMatcher.parseUnits(it) != null }
-        }.distinctBy { ProductNameMatcher.parseUnits(it) }
-        return quantities.singleOrNull()
+        return TargetSearch(best, exactHeaderFound)
     }
 
     private fun findProductColumn(
@@ -244,6 +243,97 @@ object QuoteWorkbookFiller {
         }
     }
 
+    private fun parsePriceStyles(bytes: ByteArray): PriceStyles? {
+        val document = parseXml(bytes)
+        val styleSheet = document.documentElement ?: return null
+        val cellXfs = styleSheet.childElements("cellXfs").firstOrNull() ?: return null
+        if (cellXfs.childElements("xf").isEmpty()) return null
+
+        val customFormats = styleSheet.childElements("numFmts").firstOrNull()
+        val existingFormat = customFormats?.childElements("numFmt")
+            ?.firstOrNull { it.attr("formatCode").replace("\\", "") == THREE_DECIMAL_FORMAT }
+        val formatId = existingFormat?.attr("numFmtId")?.takeIf(String::isNotBlank)
+            ?: createThreeDecimalFormat(document, styleSheet, customFormats)
+        return PriceStyles(document, cellXfs, formatId, changed = existingFormat == null)
+    }
+
+    private fun createThreeDecimalFormat(
+        document: Document,
+        styleSheet: Element,
+        existingFormats: Element?
+    ): String {
+        val numFmts = existingFormats ?: document.createElementNS(SHEET_NS, "numFmts").also { created ->
+            val firstStyleSection = styleSheet.childElements().firstOrNull { it.localName != "numFmts" }
+            if (firstStyleSection != null) styleSheet.insertBefore(created, firstStyleSection) else styleSheet.appendChild(created)
+        }
+        val usedIds = numFmts.childElements("numFmt").mapNotNull { it.attr("numFmtId").toIntOrNull() }.toSet()
+        val formatId = generateSequence(FIRST_CUSTOM_NUMBER_FORMAT_ID) { it + 1 }
+            .first { it !in usedIds }
+        val format = document.createElementNS(SHEET_NS, "numFmt")
+        format.setAttribute("numFmtId", formatId.toString())
+        format.setAttribute("formatCode", THREE_DECIMAL_FORMAT)
+        numFmts.appendChild(format)
+        numFmts.setAttribute("count", numFmts.childElements("numFmt").size.toString())
+        return formatId.toString()
+    }
+
+    private fun PriceStyles.threeDecimalStyle(originalStyle: String): Int {
+        val styles = cellXfs.childElements("xf")
+        val requestedIndex = originalStyle.toIntOrNull() ?: 0
+        val baseIndex = requestedIndex.takeIf { it in styles.indices } ?: 0
+        cache[baseIndex]?.let { return it }
+        val base = styles[baseIndex]
+        val existingIndex = styles.indexOfFirst { candidate ->
+            candidate.attr("numFmtId") == numberFormatId &&
+                candidate.attr("applyNumberFormat") == "1" &&
+                candidate.sameBaseStyleAs(base)
+        }
+        if (existingIndex >= 0) {
+            cache[baseIndex] = existingIndex
+            return existingIndex
+        }
+
+        val created = base.cloneNode(true) as Element
+        created.setAttribute("numFmtId", numberFormatId)
+        created.setAttribute("applyNumberFormat", "1")
+        cellXfs.appendChild(created)
+        val createdIndex = cellXfs.childElements("xf").lastIndex
+        cellXfs.setAttribute("count", (createdIndex + 1).toString())
+        cache[baseIndex] = createdIndex
+        changed = true
+        return createdIndex
+    }
+
+    private fun Element.sameBaseStyleAs(other: Element): Boolean =
+        styleAttributes() == other.styleAttributes() &&
+            childElements().map { it.structuralSignature() } ==
+            other.childElements().map { it.structuralSignature() }
+
+    private fun Element.styleAttributes(): Map<String, String> = buildMap {
+        val attributes = attributes
+        for (index in 0 until attributes.length) {
+            val attribute = attributes.item(index)
+            if (attribute.nodeName !in NUMBER_FORMAT_STYLE_ATTRIBUTES) put(attribute.nodeName, attribute.nodeValue)
+        }
+    }
+
+    private fun Element.structuralSignature(): String = buildString {
+        append(localName)
+        append('[')
+        val attributes = attributes
+        val values = buildList {
+            for (index in 0 until attributes.length) {
+                val attribute = attributes.item(index)
+                add(attribute.nodeName to attribute.nodeValue)
+            }
+        }.sortedBy { it.first }
+        values.forEach { (name, value) -> append(name).append('=').append(value).append(';') }
+        append(']')
+        childElements().forEach { append(it.structuralSignature()) }
+        val text = textContent.orEmpty().trim()
+        if (childElements().isEmpty() && text.isNotEmpty()) append('{').append(text).append('}')
+    }
+
     private fun readCell(cell: Element, sharedStrings: List<String>): String {
         val inline = cell.getElementsByTagNameNS("*", "is")
         if (inline.length > 0) return inline.item(0).textContent.orEmpty()
@@ -259,6 +349,19 @@ object QuoteWorkbookFiller {
         val number = ownerDocument.createElementNS(SHEET_NS, "v")
         number.textContent = value
         appendChild(number)
+    }
+
+    /** Changes only the cell contents and keeps its existing style/position attributes. */
+    private fun Element.writeText(value: String) {
+        setAttribute("t", "inlineStr")
+        childElements("f").forEach { removeChild(it) }
+        childElements("is").forEach { removeChild(it) }
+        childElements("v").forEach { removeChild(it) }
+        val inline = ownerDocument.createElementNS(SHEET_NS, "is")
+        val text = ownerDocument.createElementNS(SHEET_NS, "t")
+        text.textContent = value
+        inline.appendChild(text)
+        appendChild(inline)
     }
 
     private fun Element.getOrCreateCell(column: Int, rowNumber: Int, document: Document): Element {
@@ -334,6 +437,14 @@ object QuoteWorkbookFiller {
         }
     }
 
+    private fun Element.childElements(): List<Element> = buildList {
+        var child: Node? = firstChild
+        while (child != null) {
+            if (child is Element) add(child)
+            child = child.nextSibling
+        }
+    }
+
     private fun Element.attr(name: String): String = getAttribute(name).orEmpty()
 
     private fun String.columnNumberOrNull(): Int? {
@@ -355,4 +466,11 @@ object QuoteWorkbookFiller {
 
     private const val SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     private const val REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    private const val INPUT_HEADER = "NOME"
+    private const val OUTPUT_HEADER = "Vila"
+    private const val FIXED_SUPPLIER_NAME = "VILA NOVA"
+    private const val STYLES_PATH = "xl/styles.xml"
+    private const val THREE_DECIMAL_FORMAT = "0.000"
+    private const val FIRST_CUSTOM_NUMBER_FORMAT_ID = 164
+    private val NUMBER_FORMAT_STYLE_ATTRIBUTES = setOf("numFmtId", "applyNumberFormat")
 }

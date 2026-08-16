@@ -29,7 +29,9 @@ Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, g
 - Se você já entrou e navegou até a cotação, **Preencher automático** trabalha na página aberta em vez de recarregar o link de login.
 - Credenciais cifradas com AES-GCM e chave armazenada no Android Keystore.
 - **Preenchimento do portal em segundo plano**: o WebView pertence a um serviço em primeiro plano com `WAKE_LOCK` parcial, então bloquear a tela ou sair do aplicativo não interrompe mais o processo. A tela apenas exibe o WebView do serviço e o devolve ao sair.
-- Barra de progresso na tela e notificação com o andamento (`X de Y` produtos).
+- **Painel de andamento** com barra animada, percentual, contagem `X de Y` e **estimativa de tempo restante** medida pelo ritmo real da execução — nada de constante chutada. As quatro etapas (`ABRIR`, `ENTRAR`, `LOCALIZAR`, `PREENCHER`) aparecem como trilha, com a atual destacada.
+- Nas fases sem percentual (carregar a página, entrar, localizar a tabela) a barra roda um segmento deslizante e a tela mostra o tempo decorrido, atualizado a cada segundo: uma espera longa nunca se confunde com travamento.
+- A notificação carrega o mesmo percentual e a mesma estimativa, para acompanhar com a tela bloqueada.
 - As colunas do portal (`Código`, `Código Barra`, `Descrição`, `Custo`) são descobertas pelos títulos da própria tabela, sem depender de seletores CSS fixos. O cabeçalho não é assumido como a primeira linha: a cotação abre com uma faixa de grupo (`LOJA BAZAR GERAL`) acima dos títulos, então as primeiras linhas são avaliadas e vence a que revela mais colunas conhecidas.
 - Uma cotação dividida em vários grupos/tabelas é preenchida por inteiro: as linhas recebem um índice global e guardam a própria coluna de custo, e uma tabela de layout que envolva a tabela real é descartada para nenhum produto ser contado duas vezes.
 - Havendo mais de uma coluna numérica, `Custo` ganha de `Preço`/`Valor`, desde que tenha campo editável. A conferência do valor gravado entende o formato brasileiro (`1.234,56`).

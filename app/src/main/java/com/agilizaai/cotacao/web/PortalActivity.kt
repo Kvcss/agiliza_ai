@@ -9,9 +9,12 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -19,7 +22,6 @@ import android.webkit.WebView
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedDispatcher
@@ -39,7 +41,9 @@ class PortalActivity : Activity() {
     private lateinit var preferences: AppPreferences
     private lateinit var status: TextView
     private lateinit var detail: TextView
-    private lateinit var progressBar: ProgressBar
+    private lateinit var percentLabel: TextView
+    private lateinit var progressBar: PortalProgressBar
+    private val stepChips = mutableListOf<TextView>()
     private lateinit var webHost: FrameLayout
     private lateinit var primaryAction: Button
     private lateinit var stopAction: Button
@@ -48,8 +52,25 @@ class PortalActivity : Activity() {
     private var bound = false
     private var borrowed: WebView? = null
     private var completionShown = false
+    private var contentReady = false
+    private var lastProgress = PortalFillService.Progress()
 
     private val listener: (PortalFillService.Progress) -> Unit = { render(it) }
+
+    /**
+     * Redesenha os tempos uma vez por segundo. Entre uma atualização e outra do
+     * serviço pode passar bastante tempo — o carregamento da página é o pior caso — e
+     * um "há 4s" congelado na tela é justamente o que faz o app parecer travado.
+     */
+    private val ticker = object : Runnable {
+        override fun run() {
+            if (lastProgress.running) {
+                renderTimings(lastProgress)
+                clockHandler.postDelayed(this, TICK_MS)
+            }
+        }
+    }
+    private val clockHandler = Handler(Looper.getMainLooper())
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -75,6 +96,7 @@ class PortalActivity : Activity() {
             return
         }
         setContentView(buildContent())
+        contentReady = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
                 OnBackInvokedDispatcher.PRIORITY_DEFAULT,
@@ -85,10 +107,15 @@ class PortalActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        // `finish()` em onCreate ainda deixa o ciclo passar por aqui. Conectar ao
+        // serviço sem a tela montada faria o primeiro progresso desenhar em campos
+        // que não existem.
+        if (!contentReady) return
         bindService(Intent(this, PortalFillService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
 
     override fun onStop() {
+        clockHandler.removeCallbacks(ticker)
         // Devolve o WebView para o serviço: o preenchimento continua sem a tela.
         releaseWebView()
         service?.removeListener(listener)
@@ -125,38 +152,7 @@ class PortalActivity : Activity() {
             setBackgroundColor(color(R.color.surface))
         }
 
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(15), dp(12), dp(15), dp(12))
-            setBackgroundColor(color(R.color.navy))
-        }
-        header.addView(TextView(this).apply {
-            text = "Portal de cotação"
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
-        })
-        status = TextView(this).apply {
-            text = "Pronto para preencher · base ${preferences.portalConditionDays} dias"
-            setTextColor(Color.rgb(205, 217, 236))
-            textSize = 12f
-            setPadding(0, dp(4), 0, dp(7))
-        }
-        header.addView(status)
-        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            progress = 0
-            isIndeterminate = false
-        }
-        header.addView(progressBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)))
-        detail = TextView(this).apply {
-            text = "O preenchimento continua mesmo com a tela bloqueada."
-            setTextColor(Color.rgb(160, 180, 210))
-            textSize = 11f
-            setPadding(0, dp(6), 0, 0)
-        }
-        header.addView(detail)
-        root.addView(header)
+        root.addView(buildProgressHeader())
 
         webHost = FrameLayout(this)
         root.addView(webHost, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -181,6 +177,93 @@ class PortalActivity : Activity() {
             setBackgroundColor(Color.WHITE)
         })
         return root
+    }
+
+    /**
+     * Cabeçalho de andamento.
+     *
+     * O preenchimento passa vários segundos abrindo a página, entrando e procurando a
+     * tabela antes de escrever o primeiro preço. Sem percentual, contagem e etapa
+     * visíveis, essa espera é indistinguível de um travamento — que é exatamente a
+     * dúvida que este painel existe para eliminar.
+     */
+    private fun buildProgressHeader(): View {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            setBackgroundColor(color(R.color.navy))
+        }
+
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+        }
+        titleRow.addView(
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(this@PortalActivity).apply {
+                    text = "Portal de cotação"
+                    setTextColor(Color.WHITE)
+                    textSize = 17f
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                status = TextView(this@PortalActivity).apply {
+                    text = "Pronto para preencher · base ${preferences.portalConditionDays} dias"
+                    setTextColor(Color.rgb(205, 217, 236))
+                    textSize = 12f
+                    setPadding(0, dp(3), 0, 0)
+                }
+                addView(status)
+            }
+        )
+        percentLabel = TextView(this).apply {
+            text = ""
+            setTextColor(Color.WHITE)
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.END
+            setPadding(dp(8), 0, 0, 0)
+        }
+        titleRow.addView(percentLabel)
+        header.addView(titleRow)
+
+        progressBar = PortalProgressBar(this)
+        header.addView(
+            progressBar,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)).apply {
+                topMargin = dp(11)
+            }
+        )
+
+        detail = TextView(this).apply {
+            text = "O preenchimento continua mesmo com a tela bloqueada."
+            setTextColor(Color.rgb(170, 190, 218))
+            textSize = 12f
+            setPadding(0, dp(8), 0, 0)
+        }
+        header.addView(detail)
+
+        val stepsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        STEPS.forEachIndexed { position, step ->
+            val chip = TextView(this).apply {
+                text = step.second
+                textSize = 10f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setPadding(dp(4), dp(5), dp(4), dp(5))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (position > 0) marginStart = dp(5)
+                }
+            }
+            stepChips += chip
+            stepsRow.addView(chip)
+        }
+        header.addView(stepsRow)
+        return header
     }
 
     private fun start() {
@@ -228,20 +311,35 @@ class PortalActivity : Activity() {
     }
 
     private fun render(update: PortalFillService.Progress) {
+        lastProgress = update
         status.text = update.message.ifBlank { "Pronto para preencher" }
-        progressBar.isIndeterminate = update.running && update.total <= 0
-        if (update.total > 0) {
-            progressBar.isIndeterminate = false
-            progressBar.max = update.total
-            progressBar.progress = update.processed
+
+        when {
+            update.hasPercent -> {
+                percentLabel.visibility = View.VISIBLE
+                percentLabel.text = "${update.percent}%"
+                progressBar.setProgress(update.processed.toFloat() / update.total)
+            }
+            update.phase == PortalFillService.Phase.DONE -> {
+                percentLabel.visibility = View.VISIBLE
+                percentLabel.text = "100%"
+                progressBar.setProgress(1f)
+            }
+            update.running -> {
+                percentLabel.visibility = View.GONE
+                progressBar.setIndeterminate()
+            }
+            else -> {
+                percentLabel.visibility = View.GONE
+                progressBar.setProgress(0f, animate = false)
+            }
         }
-        detail.text = when {
-            update.phase == PortalFillService.Phase.DONE ->
-                "${update.filled} confirmados · ${update.skipped} em branco · revise e salve no portal"
-            update.running ->
-                "${update.percent}% · ${update.filled} preenchidos · continua com a tela bloqueada"
-            else -> "O preenchimento continua mesmo com a tela bloqueada."
-        }
+        renderSteps(update)
+        renderTimings(update)
+
+        clockHandler.removeCallbacks(ticker)
+        if (update.running) clockHandler.postDelayed(ticker, TICK_MS)
+
         primaryAction.isEnabled = !update.running
         primaryAction.alpha = if (update.running) 0.5f else 1f
         stopAction.isEnabled = update.running
@@ -251,6 +349,72 @@ class PortalActivity : Activity() {
             completionShown = true
             attachWebView(service ?: return)
             showSummary(update)
+        }
+    }
+
+    /** Acende a etapa atual e marca como concluídas as que já passaram. */
+    private fun renderSteps(update: PortalFillService.Progress) {
+        val current = STEPS.indexOfFirst { it.first == update.phase }
+        val done = update.phase == PortalFillService.Phase.DONE
+        stepChips.forEachIndexed { position, chip ->
+            val reached = done || (current >= 0 && position < current)
+            val active = !done && position == current
+            chip.setTextColor(
+                when {
+                    active -> Color.WHITE
+                    reached -> Color.rgb(116, 232, 194)
+                    else -> Color.rgb(120, 140, 170)
+                }
+            )
+            chip.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(9).toFloat()
+                setColor(
+                    when {
+                        active -> Color.argb(52, 96, 165, 250)
+                        reached -> Color.argb(38, 52, 211, 153)
+                        else -> Color.argb(26, 255, 255, 255)
+                    }
+                )
+                if (active) setStroke(dp(1), Color.rgb(96, 165, 250))
+            }
+        }
+    }
+
+    /**
+     * Linha de contagem e tempo. É o que responde "quanto falta?" — e, nas fases sem
+     * percentual, "há quanto tempo isso está rodando?".
+     */
+    private fun renderTimings(update: PortalFillService.Progress) {
+        val elapsed = PortalProgressText.elapsed(update.elapsedMillis())
+        detail.text = when {
+            update.phase == PortalFillService.Phase.DONE -> buildString {
+                append(PortalProgressText.count(update.filled)).append(" confirmados · ")
+                append(PortalProgressText.count(update.skipped)).append(" em branco")
+                append(" · revise e salve no portal")
+            }
+            update.phase == PortalFillService.Phase.FAILED ->
+                "Preenchimento interrompido. Você pode tentar de novo sem perder a página."
+            update.hasPercent -> buildString {
+                append(PortalProgressText.count(update.processed)).append(" de ")
+                append(PortalProgressText.count(update.total)).append(" produtos")
+                val eta = PortalProgressText.remaining(update.etaSeconds)
+                if (eta.isNotBlank()) append(" · ").append(eta)
+                append("\n").append(PortalProgressText.count(update.filled))
+                append(" confirmados pelo portal · continua com a tela bloqueada")
+            }
+            update.running -> buildString {
+                append(
+                    when (update.phase) {
+                        PortalFillService.Phase.LOADING -> "Abrindo a página do portal"
+                        PortalFillService.Phase.LOGIN -> "Enviando código e senha"
+                        else -> "Procurando a tabela da cotação"
+                    }
+                )
+                if (elapsed.isNotBlank()) append(" · ").append(elapsed)
+                append("\nPode bloquear a tela — o trabalho continua.")
+            }
+            else -> "O preenchimento continua mesmo com a tela bloqueada."
         }
     }
 
@@ -289,5 +453,14 @@ class PortalActivity : Activity() {
 
     private companion object {
         const val REQUEST_NOTIFICATIONS = 9301
+        const val TICK_MS = 1_000L
+
+        /** Etapas mostradas em sequência, na ordem em que o serviço passa por elas. */
+        val STEPS = listOf(
+            PortalFillService.Phase.LOADING to "ABRIR",
+            PortalFillService.Phase.LOGIN to "ENTRAR",
+            PortalFillService.Phase.LOCATING to "LOCALIZAR",
+            PortalFillService.Phase.FILLING to "PREENCHER"
+        )
     }
 }

@@ -53,11 +53,21 @@ class PortalFillService : Service() {
         val total: Int = 0,
         val filled: Int = 0,
         val skipped: Int = 0,
-        val bySignal: Map<String, Int> = emptyMap()
+        val bySignal: Map<String, Int> = emptyMap(),
+        /** Início da execução, para a tela mostrar há quanto tempo ela trabalha. */
+        val startedAt: Long = 0L,
+        /** Segundos restantes estimados, ou -1 enquanto não houver medida confiável. */
+        val etaSeconds: Int = -1
     ) {
         val percent: Int get() = if (total <= 0) 0 else (processed * 100 / total).coerceIn(0, 100)
         val running: Boolean get() = phase == Phase.LOADING || phase == Phase.LOGIN ||
             phase == Phase.LOCATING || phase == Phase.FILLING
+
+        /** Só o preenchimento tem percentual real; as outras fases são de espera. */
+        val hasPercent: Boolean get() = phase == Phase.FILLING && total > 0
+
+        fun elapsedMillis(now: Long = System.currentTimeMillis()): Long =
+            if (startedAt <= 0L) 0L else (now - startedAt).coerceAtLeast(0L)
     }
 
     inner class LocalBinder : Binder() {
@@ -79,6 +89,8 @@ class PortalFillService : Service() {
     private var locateAttempts = 0
     private var batchStart = 0
     private var stopping = false
+    private var runStartedAt = 0L
+    private var fillStartedAt = 0L
 
     private var progress = Progress()
     private val listeners = mutableSetOf<(Progress) -> Unit>()
@@ -202,6 +214,8 @@ class PortalFillService : Service() {
         locateAttempts = 0
         batchStart = 0
         stopping = false
+        runStartedAt = System.currentTimeMillis()
+        fillStartedAt = 0L
         resolutions = emptyList()
         indexReport = null
 
@@ -216,16 +230,18 @@ class PortalFillService : Service() {
         if (alreadyOnPortal) {
             publish(
                 Progress(
-                    Phase.LOCATING,
-                    "Procurando a cotação na página aberta · $usableBaseItems preços de $days dias prontos…"
+                    phase = Phase.LOCATING,
+                    message = "Procurando a cotação na página aberta · $usableBaseItems preços de $days dias prontos…",
+                    startedAt = runStartedAt
                 )
             )
             handler.postDelayed(::probe, PROBE_DELAY_MS)
         } else {
             publish(
                 Progress(
-                    Phase.LOADING,
-                    "Abrindo $allowedHost · $usableBaseItems preços de $days dias prontos…"
+                    phase = Phase.LOADING,
+                    message = "Abrindo $allowedHost · $usableBaseItems preços de $days dias prontos…",
+                    startedAt = runStartedAt
                 )
             )
             view.loadUrl(preferences.portalUrl)
@@ -407,6 +423,7 @@ class PortalFillService : Service() {
             indexReport = report
             resolutions = report.resolutions
             batchStart = 0
+            fillStartedAt = System.currentTimeMillis()
             publish(
                 Progress(
                     phase = Phase.FILLING,
@@ -414,7 +431,8 @@ class PortalFillService : Service() {
                     processed = 0,
                     total = report.matched,
                     filled = 0,
-                    skipped = rows.size - report.matched
+                    skipped = rows.size - report.matched,
+                    startedAt = runStartedAt
                 )
             )
             fillNextBatch()
@@ -439,11 +457,28 @@ class PortalFillService : Service() {
                     processed = batchStart,
                     filled = progress.filled + confirmed,
                     skipped = progress.skipped + rejected,
-                    message = "Preenchendo… $batchStart de ${resolutions.size}"
+                    message = "Preenchendo… $batchStart de ${resolutions.size}",
+                    etaSeconds = estimateRemainingSeconds(batchStart, resolutions.size)
                 )
             )
             handler.postDelayed(::fillNextBatch, BATCH_PAUSE_MS)
         }
+    }
+
+    /**
+     * Estimativa do tempo restante a partir do ritmo real medido nesta execução.
+     *
+     * A velocidade depende do tamanho da página e do quanto o próprio portal recalcula
+     * a cada preço escrito, então não há constante que sirva: a média do que já foi
+     * feito é a única medida honesta. Enquanto a amostra for pequena demais para
+     * significar alguma coisa, o retorno é -1 e a tela não promete prazo nenhum.
+     */
+    private fun estimateRemainingSeconds(processed: Int, total: Int): Int {
+        if (fillStartedAt <= 0L || processed <= 0 || processed >= total) return -1
+        val elapsed = System.currentTimeMillis() - fillStartedAt
+        if (elapsed < MIN_ELAPSED_FOR_ETA_MS) return -1
+        val remaining = (total - processed).toDouble() * elapsed / processed
+        return (remaining / 1000.0).toInt().coerceIn(1, MAX_ETA_SECONDS)
     }
 
     private fun finish() {
@@ -531,6 +566,21 @@ class PortalFillService : Service() {
         runCatching { manager.notify(NOTIFICATION_ID, buildNotification(update)) }
     }
 
+    /**
+     * Com a tela bloqueada, a notificação é a única indicação de que o app continua
+     * trabalhando: ela carrega o mesmo percentual e a mesma estimativa da tela.
+     */
+    private fun notificationText(update: Progress): String {
+        if (!update.hasPercent) return update.message.ifBlank { "Trabalhando…" }
+        val eta = PortalProgressText.remaining(update.etaSeconds)
+        return buildString {
+            append(update.percent).append("% · ")
+            append(PortalProgressText.count(update.processed)).append(" de ")
+            append(PortalProgressText.count(update.total))
+            if (eta.isNotBlank()) append(" · ").append(eta)
+        }
+    }
+
     private fun buildNotification(update: Progress): Notification {
         val open = PendingIntent.getActivity(
             this,
@@ -551,12 +601,12 @@ class PortalFillService : Service() {
                 else -> "Preenchendo o portal"
             }
         )
-            .setContentText(update.message.ifBlank { "Trabalhando…" })
+            .setContentText(notificationText(update))
             .setSmallIcon(R.drawable.ic_app)
             .setContentIntent(open)
             .setOnlyAlertOnce(true)
             .setOngoing(update.running)
-        if (update.running && update.total > 0) {
+        if (update.hasPercent) {
             builder.setProgress(update.total, update.processed, false)
         } else if (update.running) {
             builder.setProgress(0, 0, true)
@@ -576,8 +626,12 @@ class PortalFillService : Service() {
         private const val LOCATE_RETRY_MS = 900L
         private const val LOGIN_SETTLE_MS = 1_500L
         private const val MAX_LOCATE_ATTEMPTS = 25
-        private const val BATCH_SIZE = 120
+        // Lotes menores fazem a barra andar em passos visíveis em vez de saltar de
+        // 0% para 100% em três atualizações, sem custo perceptível de velocidade.
+        private const val BATCH_SIZE = 40
         private const val BATCH_PAUSE_MS = 60L
+        private const val MIN_ELAPSED_FOR_ETA_MS = 400L
+        private const val MAX_ETA_SECONDS = 2 * 60 * 60
         private const val OFFSCREEN_WIDTH = 1080
         private const val OFFSCREEN_HEIGHT = 1920
 

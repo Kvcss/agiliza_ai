@@ -11,6 +11,15 @@ class AppPreferences(context: Context) {
         if (prefs.contains(KEY_LEGACY_PRICE_PROFILE_NAME)) {
             prefs.edit().remove(KEY_LEGACY_PRICE_PROFILE_NAME).apply()
         }
+        // Os seletores antigos procuravam um campo de e-mail. O portal identifica o
+        // usuário por "Código", então quem nunca personalizou volta para o padrão novo.
+        if (!prefs.getBoolean(KEY_LOGIN_SELECTORS_MIGRATED, false)) {
+            prefs.edit().apply {
+                if (prefs.getString(KEY_USER_SELECTOR, null) == LEGACY_USER_SELECTOR) remove(KEY_USER_SELECTOR)
+                if (prefs.getString(KEY_SUBMIT_SELECTOR, null) == LEGACY_SUBMIT_SELECTOR) remove(KEY_SUBMIT_SELECTOR)
+                putBoolean(KEY_LOGIN_SELECTORS_MIGRATED, true)
+            }.apply()
+        }
     }
 
     var targetPackage: String
@@ -61,6 +70,43 @@ class AppPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_CAPTURE_ARMED, false)
         set(value) = prefs.edit().putBoolean(KEY_CAPTURE_ARMED, value).apply()
 
+    /** `sequential` lê 7, 14, 21 e 28 em sequência; `single` lê apenas um prazo. */
+    var captureMode: String
+        get() = prefs.getString(KEY_CAPTURE_MODE, CAPTURE_MODE_SEQUENTIAL)
+            .takeIf { it == CAPTURE_MODE_SINGLE || it == CAPTURE_MODE_SEQUENTIAL }
+            ?: CAPTURE_MODE_SEQUENTIAL
+        set(value) {
+            require(value == CAPTURE_MODE_SEQUENTIAL || value == CAPTURE_MODE_SINGLE) {
+                "Modo de captura sem suporte: $value"
+            }
+            prefs.edit().putString(KEY_CAPTURE_MODE, value).apply()
+        }
+
+    /** Prazo usado quando a captura é de uma categoria só. */
+    var captureSingleDays: Int
+        get() = prefs.getInt(KEY_CAPTURE_SINGLE_DAYS, DEFAULT_CONDITION_DAYS)
+            .takeIf { it in SUPPORTED_CONDITION_DAYS }
+            ?: DEFAULT_CONDITION_DAYS
+        set(value) {
+            require(value in SUPPORTED_CONDITION_DAYS) { "Prazo de captura sem suporte: $value" }
+            prefs.edit().putInt(KEY_CAPTURE_SINGLE_DAYS, value).apply()
+        }
+
+    /**
+     * Marcado pela tela inicial quando o toque foi em RETOMAR. O serviço lê isso ao
+     * iniciar para continuar a sessão salva em vez de começar uma coleta nova.
+     */
+    var captureResumeRequested: Boolean
+        get() = prefs.getBoolean(KEY_CAPTURE_RESUME_REQUESTED, false)
+        set(value) = prefs.edit().putBoolean(KEY_CAPTURE_RESUME_REQUESTED, value).apply()
+
+    /** Prazos que a próxima coleta deve percorrer, na ordem. */
+    fun plannedConditions(): List<Int> = if (captureMode == CAPTURE_MODE_SINGLE) {
+        listOf(captureSingleDays)
+    } else {
+        CAPTURE_DAYS
+    }
+
     var captureStatus: String
         get() = prefs.getString(KEY_CAPTURE_STATUS, CAPTURE_IDLE).orEmpty()
         set(value) = prefs.edit().putString(KEY_CAPTURE_STATUS, value).apply()
@@ -68,6 +114,16 @@ class AppPreferences(context: Context) {
     var captureStatusMessage: String
         get() = prefs.getString(KEY_CAPTURE_STATUS_MESSAGE, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_CAPTURE_STATUS_MESSAGE, value).apply()
+
+    /**
+     * A última coleta terminou sem concluir. Só nesse caso faz sentido deduzir um
+     * ponto de retomada da base — depois de uma coleta concluída, um prazo vazio é
+     * escolha do usuário, não interrupção.
+     */
+    val captureWasInterrupted: Boolean
+        get() = captureStatus == CAPTURE_IN_PROGRESS ||
+            captureStatus == CAPTURE_ABORTED ||
+            captureStatus == CAPTURE_TRUNCATED
 
     var lastCaptureSavedAt: Long
         get() = prefs.getLong(KEY_LAST_CAPTURE_SAVED_AT, 0L)
@@ -89,8 +145,18 @@ class AppPreferences(context: Context) {
         get() = prefs.getString(KEY_PORTAL_URL, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_PORTAL_URL, value.trim()).apply()
 
+    /**
+     * O portal de cotação identifica o usuário como "Código", não como e-mail. Os
+     * seletores são só a primeira tentativa: o script também acha o formulário pela
+     * estrutura da página quando nenhum deles casa.
+     */
     var loginUserSelector: String
-        get() = prefs.getString(KEY_USER_SELECTOR, "input[type=email], input[name*=email i], input[name*=user i]")!!
+        get() = prefs.getString(
+            KEY_USER_SELECTOR,
+            "input[name*=codigo i], input[id*=codigo i], input[name*=login i], input[id*=login i], " +
+                "input[name*=usuario i], input[id*=usuario i], input[name*=user i], " +
+                "input[type=email], input[name*=email i]"
+        )!!
         set(value) = prefs.edit().putString(KEY_USER_SELECTOR, value.trim()).apply()
 
     var loginPasswordSelector: String
@@ -98,7 +164,11 @@ class AppPreferences(context: Context) {
         set(value) = prefs.edit().putString(KEY_PASSWORD_SELECTOR, value.trim()).apply()
 
     var loginSubmitSelector: String
-        get() = prefs.getString(KEY_SUBMIT_SELECTOR, "button[type=submit], input[type=submit]")!!
+        get() = prefs.getString(
+            KEY_SUBMIT_SELECTOR,
+            "input[type=submit], button[type=submit], input[value*=entrar i], " +
+                "button[name*=entrar i], button[id*=entrar i], input[id*=entrar i]"
+        )!!
         set(value) = prefs.edit().putString(KEY_SUBMIT_SELECTOR, value.trim()).apply()
 
     var tableRowSelector: String
@@ -125,16 +195,24 @@ class AppPreferences(context: Context) {
         const val CAPTURE_COMPLETE = "complete"
         const val CAPTURE_ABORTED = "aborted"
         const val CAPTURE_TRUNCATED = "truncated"
+        const val CAPTURE_MODE_SEQUENTIAL = "sequential"
+        const val CAPTURE_MODE_SINGLE = "single"
+
+        /** Prazos suportados pelo ION, na ordem em que a coleta sequencial os lê. */
+        val CAPTURE_DAYS = listOf(7, 14, 21, 28)
 
         private const val FILE_NAME = "agiliza_preferences"
         private const val DEFAULT_CONDITION_DAYS = 7
-        private val SUPPORTED_CONDITION_DAYS = setOf(7, 14, 21, 28)
+        private val SUPPORTED_CONDITION_DAYS = CAPTURE_DAYS.toSet()
         private const val KEY_TARGET_PACKAGE = "target_package"
         private const val KEY_CONDITION_DAYS = "condition_days"
         private const val KEY_EXCEL_CONDITION_DAYS = "excel_condition_days"
         private const val KEY_PORTAL_CONDITION_DAYS = "portal_condition_days"
         private const val KEY_LEGACY_PRICE_PROFILE_NAME = "price_profile_name"
         private const val KEY_CAPTURE_ARMED = "capture_armed"
+        private const val KEY_CAPTURE_MODE = "capture_mode"
+        private const val KEY_CAPTURE_SINGLE_DAYS = "capture_single_days"
+        private const val KEY_CAPTURE_RESUME_REQUESTED = "capture_resume_requested"
         private const val KEY_CAPTURE_STATUS = "capture_status"
         private const val KEY_CAPTURE_STATUS_MESSAGE = "capture_status_message"
         private const val KEY_LAST_CAPTURE_SAVED_AT = "last_capture_saved_at"
@@ -142,6 +220,10 @@ class AppPreferences(context: Context) {
         private const val KEY_DISCLOSURE_ACCEPTED = "accessibility_disclosure_accepted"
         private const val KEY_LAST_SEEN_PACKAGE = "last_seen_package"
         private const val KEY_PORTAL_URL = "portal_url"
+        private const val KEY_LOGIN_SELECTORS_MIGRATED = "portal_login_selectors_code_migrated"
+        private const val LEGACY_USER_SELECTOR =
+            "input[type=email], input[name*=email i], input[name*=user i]"
+        private const val LEGACY_SUBMIT_SELECTOR = "button[type=submit], input[type=submit]"
         private const val KEY_USER_SELECTOR = "portal_user_selector"
         private const val KEY_PASSWORD_SELECTOR = "portal_password_selector"
         private const val KEY_SUBMIT_SELECTOR = "portal_submit_selector"

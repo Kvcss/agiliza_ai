@@ -63,9 +63,32 @@ data class QuoteItem(
      */
     fun hasMinimumStock(): Boolean = stockValueOrNull()?.let { it >= MINIMUM_STOCK } == true
 
+    /**
+     * Produtos vendidos como conjunto (`Und: CJ`) não entram na base: o preço do ION
+     * é o do conjunto fechado e não corresponde ao custo unitário pedido pelo portal.
+     */
+    fun isExcludedSalesUnit(): Boolean = isConjuntoUnit(salesUnit) || isConjuntoUnit(packaging)
+
+    /** Uma variante só é gravada quando tem estoque suficiente e não é conjunto. */
+    fun isEligibleForBase(): Boolean = hasMinimumStock() && !isExcludedSalesUnit()
+
+    /** Mantém apenas o suficiente para auditoria sem inflar o JSON com 3.000 produtos. */
+    fun withTrimmedRawCells(limit: Int = MAX_RAW_CELLS): QuoteItem =
+        if (rawCells.size <= limit) this else copy(rawCells = rawCells.take(limit))
+
     companion object {
         val MINIMUM_STOCK: BigDecimal = BigDecimal("3")
+        const val MAX_RAW_CELLS = 12
     }
+}
+
+/**
+ * `CJ` aparece no ION como unidade de venda (`Und: CJ`) e às vezes só na embalagem
+ * (`CJ-6`). Os dois casos representam o mesmo conjunto fechado e são recusados.
+ */
+internal fun isConjuntoUnit(value: String): Boolean {
+    val normalized = value.uppercase().replace(Regex("[^A-Z]"), "")
+    return normalized == "CJ" || normalized == "CONJ" || normalized == "CONJUNTO"
 }
 
 internal fun String.toBrazilianDecimalOrNull(): BigDecimal? {

@@ -30,11 +30,16 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.agilizaai.cotacao.data.AppPreferences
+import com.agilizaai.cotacao.data.CaptureRecovery
+import com.agilizaai.cotacao.data.CaptureSession
+import com.agilizaai.cotacao.data.CaptureSessionStore
 import com.agilizaai.cotacao.data.QuoteItem
 import com.agilizaai.cotacao.data.QuoteRepository
+import com.agilizaai.cotacao.data.QuoteStats
 import com.agilizaai.cotacao.export.QuoteDocumentStreams
 import com.agilizaai.cotacao.export.QuoteWorkbookFiller
 import com.agilizaai.cotacao.export.XlsxExporter
+import com.agilizaai.cotacao.web.PortalActivity
 import com.agilizaai.cotacao.web.PortalConfigActivity
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -46,6 +51,7 @@ class MainActivity : Activity() {
     }
     private lateinit var preferences: AppPreferences
     private lateinit var repository: QuoteRepository
+    private lateinit var sessionStore: CaptureSessionStore
     private lateinit var serviceStatus: TextView
     private lateinit var ionStatus: TextView
     private lateinit var captureSummary: TextView
@@ -57,6 +63,14 @@ class MainActivity : Activity() {
     private val termCountLabels = linkedMapOf<Int, TextView>()
     private val termExportButtons = linkedMapOf<Int, Button>()
     private lateinit var captureButton: Button
+    private lateinit var captureModeGroup: RadioGroup
+    private lateinit var sequentialModeButton: RadioButton
+    private lateinit var singleModeButton: RadioButton
+    private lateinit var captureDaysGroup: RadioGroup
+    private lateinit var captureModeSummary: TextView
+    private lateinit var resumePanel: LinearLayout
+    private lateinit var resumeSummary: TextView
+    private lateinit var resumeButton: Button
     private lateinit var excelConditionGroup: RadioGroup
     private lateinit var excelBaseSummary: TextView
     private lateinit var quoteStepLabel: TextView
@@ -74,6 +88,11 @@ class MainActivity : Activity() {
     private var quoteValidationError = ""
     private var selectedQuoteTemplateSummary = ""
     private var launchingIon = false
+    private var cachedStats: QuoteStats = QuoteStats.EMPTY
+    private var cachedPreview: List<QuoteItem> = emptyList()
+    private var pendingSession: CaptureSession? = null
+    private var dataLoadInFlight = false
+    private var dataLoadRequested = false
     private val lifecycleHandler = Handler(Looper.getMainLooper())
     private val stopIdleCapture = Runnable {
         if (!launchingIon && preferences.captureArmed) sendCaptureCommand(AppPreferences.COMMAND_STOP)
@@ -91,6 +110,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         preferences = AppPreferences(this)
         repository = QuoteRepository(this)
+        sessionStore = CaptureSessionStore(this)
         restoreExcelWorkflow()
         setContentView(buildContent())
     }
@@ -247,14 +267,104 @@ class MainActivity : Activity() {
     }
 
     private fun buildCaptureCard(): View = card("1 · Nova coleta no ION").apply {
-        addView(bodyText("No ION: CLIENTES > escolha um cliente > carrinho > Novo Pedido. Fique na aba CABEÇALHO. O Agiliza escolherá 7, 14, 21 e 28 dias, abrirá cada produto apenas para leitura e voltará sem confirmar."))
+        addView(bodyText("No ION: CLIENTES > escolha um cliente > carrinho > Novo Pedido. Fique na aba CABEÇALHO. O Agiliza escolhe o prazo, abre cada produto apenas para leitura e volta sem confirmar."))
         addView(infoPanel(
             "SALVAMENTO AUTOMÁTICO",
-            "Cada produto é protegido no aparelho assim que for lido. Se algo fechar, o último rascunho continuará aqui."
+            "Cada produto é protegido no aparelho assim que for lido. Se algo fechar, a coleta pode continuar do mesmo ponto."
         ))
-        captureButton = primaryButton("INICIAR CAPTURA NO ION") { beginCapture() }
+
+        resumeSummary = TextView(this@MainActivity).apply {
+            setTextColor(color(R.color.ink))
+            textSize = 13f
+            setLineSpacing(0f, 1.16f)
+            setPadding(0, dp(4), 0, 0)
+        }
+        resumeButton = primaryButton("RETOMAR COLETA") { confirmResumeCapture() }
+        resumePanel = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(13), dp(11), dp(13), dp(13))
+            background = rounded(color(R.color.amber_soft), dp(13).toFloat())
+            addView(TextView(this@MainActivity).apply {
+                text = "COLETA INTERROMPIDA"
+                setTextColor(color(R.color.amber))
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                letterSpacing = 0.06f
+            })
+            addView(resumeSummary)
+            addView(resumeButton)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(4)
+            }
+        }
+        addView(resumePanel)
+
+        addView(TextView(this@MainActivity).apply {
+            text = "Como capturar"
+            setTextColor(color(R.color.ink))
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(2), dp(14), dp(2), dp(2))
+        })
+        captureModeGroup = RadioGroup(this@MainActivity).apply {
+            orientation = RadioGroup.VERTICAL
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        sequentialModeButton = RadioButton(this@MainActivity).apply {
+            id = View.generateViewId()
+            text = "Sequencial · 7, 14, 21 e 28 dias"
+            textSize = 14f
+            setTextColor(color(R.color.ink))
+            setOnCheckedChangeListener { _, checked -> if (checked) selectCaptureMode(AppPreferences.CAPTURE_MODE_SEQUENTIAL) }
+        }
+        singleModeButton = RadioButton(this@MainActivity).apply {
+            id = View.generateViewId()
+            text = "Somente uma categoria"
+            textSize = 14f
+            setTextColor(color(R.color.ink))
+            setOnCheckedChangeListener { _, checked -> if (checked) selectCaptureMode(AppPreferences.CAPTURE_MODE_SINGLE) }
+        }
+        captureModeGroup.addView(sequentialModeButton)
+        captureModeGroup.addView(singleModeButton)
+        addView(captureModeGroup)
+
+        captureDaysGroup = RadioGroup(this@MainActivity).apply {
+            orientation = RadioGroup.HORIZONTAL
+            setPadding(dp(22), 0, 0, dp(2))
+        }
+        CAPTURE_DAYS.forEach { days ->
+            captureDaysGroup.addView(RadioButton(this@MainActivity).apply {
+                id = View.generateViewId()
+                text = "$days"
+                textSize = 14f
+                setTextColor(color(R.color.ink))
+                isChecked = days == preferences.captureSingleDays
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked && days != preferences.captureSingleDays) {
+                        preferences.captureSingleDays = days
+                        refreshState()
+                    }
+                }
+            })
+        }
+        addView(captureDaysGroup)
+        captureModeSummary = bodyText("")
+        addView(captureModeSummary)
+
+        captureButton = primaryButton("INICIAR CAPTURA NO ION") { confirmNewCapture() }
         addView(captureButton)
         addView(textButton("Configurar permissão de captura") { showAccessibilityDisclosure() })
+    }
+
+    private fun selectCaptureMode(mode: String) {
+        if (preferences.captureMode == mode) return
+        preferences.captureMode = mode
+        refreshState()
     }
 
     private fun buildDataCard(): View = card("2 · Última coleta salva").apply {
@@ -399,19 +509,68 @@ class MainActivity : Activity() {
     }
 
     private fun buildPortalCard(): View = card("4 · Preencher o portal").apply {
-        addView(bodyText("Cadastre o link, o usuário e a senha. O app cruza cada código de barras com o preço unitário da base escolhida exclusivamente para o portal."))
+        addView(bodyText("Cadastre o link, o código de acesso e a senha. O app entra sozinho, encontra cada produto pelo código de barras, pelo código do produto confirmado pelo nome, e escreve o preço unitário da base escolhida para o portal."))
+        addView(infoPanel(
+            "CONTINUA COM A TELA BLOQUEADA",
+            "O preenchimento roda em segundo plano com uma notificação de progresso. Sair do app ou bloquear o celular não interrompe mais o processo."
+        ))
         portalSummary = bodyText("").apply {
             setTextColor(color(R.color.ink))
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(2), dp(7), dp(2), dp(10))
         }
         addView(portalSummary)
+        addView(primaryButton("ABRIR E PREENCHER PORTAL") {
+            if (preferences.portalUrl.isBlank()) {
+                toast("Cadastre o link do portal antes de abrir")
+                startActivity(Intent(this@MainActivity, PortalConfigActivity::class.java))
+            } else {
+                startActivity(Intent(this@MainActivity, PortalActivity::class.java))
+            }
+        })
         addView(secondaryButton("CONFIGURAR PORTAL") {
             startActivity(Intent(this@MainActivity, PortalConfigActivity::class.java))
         })
     }
 
+    /**
+     * Uma base com 3.000 produtos por prazo não pode ser lida na thread principal:
+     * era isso que travava a abertura do aplicativo. A tela desenha imediatamente com
+     * o último resumo conhecido e o disco é lido em segundo plano.
+     */
     private fun refreshState() {
+        renderState(cachedStats)
+        if (dataLoadInFlight) {
+            dataLoadRequested = true
+            return
+        }
+        dataLoadInFlight = true
+        Thread {
+            val stats = runCatching { repository.stats() }.getOrDefault(QuoteStats.EMPTY)
+            val preview = runCatching { repository.load().take(PREVIEW_LIMIT) }.getOrDefault(emptyList())
+            val session = runCatching { sessionStore.resumable() }.getOrNull()
+                ?: runCatching {
+                    if (!preferences.captureWasInterrupted) null else CaptureRecovery.deduce(
+                        pricedByDays = stats.pricedByDays,
+                        conditions = AppPreferences.CAPTURE_DAYS,
+                        updatedAt = preferences.lastCaptureSavedAt
+                    )
+                }.getOrNull()
+            runOnUiThread {
+                dataLoadInFlight = false
+                cachedStats = stats
+                cachedPreview = preview
+                pendingSession = session
+                renderState(stats)
+                if (dataLoadRequested) {
+                    dataLoadRequested = false
+                    refreshState()
+                }
+            }
+        }.start()
+    }
+
+    private fun renderState(stats: QuoteStats) {
         val accessibilityEnabled = isCaptureServiceEnabled()
         serviceStatus.text = if (accessibilityEnabled) "●  Captura autorizada" else "●  Permissão ainda não ativada"
         serviceStatus.setTextColor(color(if (accessibilityEnabled) R.color.green else R.color.amber))
@@ -421,18 +580,19 @@ class MainActivity : Activity() {
         ionStatus.text = if (ionInstalled) "●  Ion Vendas encontrado" else "●  Ion Vendas não encontrado"
         ionStatus.setTextColor(color(if (ionInstalled) R.color.green else R.color.amber))
         captureButton.isEnabled = ionInstalled
+        renderCapturePlan(ionInstalled)
 
-        val items = repository.load()
+        val totalItems = stats.total
         val captureComplete = preferences.captureStatus == AppPreferences.CAPTURE_COMPLETE
-        val hasDraft = repository.hasDraft()
+        val hasDraft = stats.hasDraft
         val summaryStyle = when {
             preferences.captureStatus == AppPreferences.CAPTURE_IN_PROGRESS ->
                 Triple("●  COLETA EM ANDAMENTO", R.color.blue, R.color.blue_soft)
             captureComplete ->
                 Triple("✓  COLETA COMPLETA", R.color.green, R.color.green_soft)
-            hasDraft && items.isNotEmpty() ->
+            hasDraft && totalItems > 0 ->
                 Triple("●  RASCUNHO PROTEGIDO", R.color.amber, R.color.amber_soft)
-            items.isNotEmpty() ->
+            totalItems > 0 ->
                 Triple("✓  ÚLTIMA COLETA SALVA", R.color.green, R.color.green_soft)
             else ->
                 Triple("PRONTO PARA CAPTURAR", R.color.blue, R.color.blue_soft)
@@ -441,7 +601,7 @@ class MainActivity : Activity() {
         captureSummary.setTextColor(color(summaryStyle.second))
         captureSummary.background = rounded(color(summaryStyle.third), dp(12).toFloat())
         val savedAt = preferences.lastCaptureSavedAt
-        saveStatus.text = if (items.isEmpty()) {
+        saveStatus.text = if (totalItems == 0) {
             "Nenhum dado salvo ainda. A coleta fica somente neste aparelho."
         } else {
             val whenSaved = if (savedAt > 0L) {
@@ -450,21 +610,21 @@ class MainActivity : Activity() {
                 "horário não registrado"
             }
             val kind = if (hasDraft) "Rascunho atualizado" else "Última coleta atualizada"
-            "$kind em $whenSaved · ${items.size} produtos disponíveis"
+            "$kind em $whenSaved · $totalItems produtos disponíveis"
         }
-        itemCount.text = when (items.size) {
+        itemCount.text = when (totalItems) {
             0 -> "Nenhum item capturado"
             1 -> "1 item capturado"
-            else -> "${items.size} itens capturados"
+            else -> "$totalItems itens capturados"
         }
-        if (items.isNotEmpty() && !captureComplete) {
+        if (totalItems > 0 && !captureComplete) {
             itemCount.text = "${itemCount.text}\nRascunho disponível para exportação"
             itemCount.setTextColor(color(R.color.amber))
         } else {
             itemCount.setTextColor(color(R.color.ink))
         }
         CAPTURE_DAYS.forEach { days ->
-            val count = items.count { it.priceForDays(days).isNotBlank() }
+            val count = stats.pricedFor(days)
             termCountLabels[days]?.text = when (count) {
                 0 -> "Aguardando captura"
                 1 -> "1 produto com preço salvo"
@@ -475,29 +635,27 @@ class MainActivity : Activity() {
                 alpha = if (isEnabled) 1f else 0.45f
             }
         }
-        consolidatedCount.text = when (items.size) {
+        consolidatedCount.text = when (totalItems) {
             0 -> "Aguardando captura"
             1 -> "1 produto · quatro colunas de prazo"
-            else -> "${items.size} produtos · quatro colunas de prazo"
+            else -> "$totalItems produtos · quatro colunas de prazo"
         }
-        exportButton.isEnabled = items.isNotEmpty()
+        exportButton.isEnabled = totalItems > 0
         exportButton.alpha = if (exportButton.isEnabled) 1f else 0.45f
         val excelConditionDays = preferences.excelConditionDays
-        val excelPriceCount = items.count { it.priceForDays(excelConditionDays).isNotBlank() }
+        val excelPriceCount = stats.pricedFor(excelConditionDays)
         excelBaseSummary.text =
             "Base selecionada: $excelConditionDays dias · $excelPriceCount preços disponíveis\nFornecedor fixo: $FIXED_SUPPLIER_NAME"
         if (::portalSummary.isInitialized) {
             val portalDays = preferences.portalConditionDays
-            val portalPriceCount = items.count {
-                it.barcode.filter(Char::isDigit).length in 8..14 && it.priceForDays(portalDays).isNotBlank()
-            }
+            val portalPriceCount = minOf(stats.withPortalBarcode, stats.pricedFor(portalDays))
             portalSummary.text = "Base do portal: $portalDays dias · $portalPriceCount preços unitários com EAN"
         }
         refreshExcelWorkflow(
-            hasItems = items.isNotEmpty(),
+            hasItems = totalItems > 0,
             selectedTableReady = excelPriceCount > 0
         )
-        renderPreview(items)
+        renderPreview(cachedPreview, totalItems)
     }
 
     private fun refreshExcelWorkflow(hasItems: Boolean, selectedTableReady: Boolean) {
@@ -596,7 +754,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderPreview(items: List<QuoteItem>) {
+    private fun renderPreview(items: List<QuoteItem>, totalItems: Int) {
         previewContainer.removeAllViews()
         if (items.isEmpty()) {
             previewContainer.addView(bodyText("Abra a tabela desejada no Ion e use o botão de captura."))
@@ -625,20 +783,105 @@ class MainActivity : Activity() {
                 })
             })
         }
-        if (items.size > PREVIEW_LIMIT) {
-            previewContainer.addView(bodyText("Mais ${items.size - PREVIEW_LIMIT} itens serão incluídos no Excel."))
+        if (totalItems > PREVIEW_LIMIT) {
+            previewContainer.addView(bodyText("Mais ${totalItems - PREVIEW_LIMIT} itens serão incluídos no Excel."))
         }
     }
 
-    private fun beginCapture() {
+    /** Reflete na tela o plano escolhido e a coleta interrompida que pode continuar. */
+    private fun renderCapturePlan(ionInstalled: Boolean) {
+        if (!::captureModeGroup.isInitialized) return
+        val singleMode = preferences.captureMode == AppPreferences.CAPTURE_MODE_SINGLE
+        if (sequentialModeButton.isChecked == singleMode) sequentialModeButton.isChecked = !singleMode
+        if (singleModeButton.isChecked != singleMode) singleModeButton.isChecked = singleMode
+        for (index in 0 until captureDaysGroup.childCount) {
+            captureDaysGroup.getChildAt(index).apply {
+                isEnabled = singleMode
+                alpha = if (singleMode) 1f else 0.45f
+            }
+        }
+        val singleDays = preferences.captureSingleDays
+        captureModeSummary.text = if (singleMode) {
+            "Somente a tabela de $singleDays dias será lida. Os preços já salvos dos outros prazos continuam na base."
+        } else {
+            "As quatro tabelas serão lidas em sequência, uma após a outra, substituindo a base atual."
+        }
+        captureButton.text = if (singleMode) {
+            "CAPTURAR SOMENTE $singleDays DIAS"
+        } else {
+            "INICIAR CAPTURA SEQUENCIAL"
+        }
+
+        val session = pendingSession
+        if (session == null) {
+            resumePanel.visibility = View.GONE
+            return
+        }
+        resumePanel.visibility = View.VISIBLE
+        val afterCurrent = session.remainingConditions.drop(1)
+        val interrupted = if (session.updatedAt > 0L) {
+            SimpleDateFormat("dd/MM 'às' HH:mm", Locale("pt", "BR")).format(Date(session.updatedAt))
+        } else {
+            ""
+        }
+        resumeSummary.text = buildString {
+            append("Parou na tabela de ").append(session.currentDays).append(" dias com ")
+            append(session.readInCurrentCondition).append(" produtos já percorridos neste prazo.")
+            if (afterCurrent.isNotEmpty()) {
+                append("\nDepois dele ainda faltam: ")
+                append(afterCurrent.joinToString(", ") { "$it dias" }).append(".")
+            }
+            if (interrupted.isNotBlank()) append("\nÚltimo registro em ").append(interrupted).append(".")
+            append("\nRetomar continua deste ponto, sem repetir o que já foi lido.")
+        }
+        resumeButton.text = "RETOMAR DE ${session.currentDays} DIAS"
+        resumeButton.isEnabled = ionInstalled
+        resumeButton.alpha = if (ionInstalled) 1f else 0.45f
+    }
+
+    private fun confirmResumeCapture() {
+        val session = pendingSession ?: return
+        AlertDialog.Builder(this)
+            .setTitle("Retomar a coleta de ${session.currentDays} dias?")
+            .setMessage(
+                "O Agiliza volta ao início da tabela, pula os ${session.readInCurrentCondition} produtos " +
+                    "já lidos neste prazo e continua a partir daí. Nada do que já foi salvo será perdido."
+            )
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Retomar") { _, _ -> beginCapture(resume = true) }
+            .show()
+    }
+
+    private fun confirmNewCapture() {
+        val session = pendingSession
+        if (session == null) {
+            beginCapture(resume = false)
+            return
+        }
+        // Começar do zero descarta o ponto de retomada. Sem este aviso, um toque
+        // no botão errado jogaria fora horas de leitura já feitas.
+        AlertDialog.Builder(this)
+            .setTitle("Descartar a coleta interrompida?")
+            .setMessage(
+                "Existe uma coleta parada na tabela de ${session.currentDays} dias. " +
+                    "Iniciar uma nova captura descarta esse ponto de retomada — os produtos já salvos continuam na base."
+            )
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Iniciar do zero") { _, _ -> beginCapture(resume = false) }
+            .show()
+    }
+
+    private fun beginCapture(resume: Boolean) {
         if (!isCaptureServiceEnabled()) {
             showAccessibilityDisclosure()
             return
         }
-        launchIonForCapture()
+        launchIonForCapture(resume)
     }
 
-    private fun launchIonForCapture() {
+    private fun launchIonForCapture(resume: Boolean) {
+        val session = pendingSession
+        preferences.captureResumeRequested = resume && session != null
         preferences.captureArmed = true
         preferences.captureStatus = AppPreferences.CAPTURE_IN_PROGRESS
         preferences.captureStatusMessage = "Captura em andamento"
@@ -646,10 +889,17 @@ class MainActivity : Activity() {
         val launchIntent = packageManager.getLaunchIntentForPackage(preferences.targetPackage)
         if (launchIntent == null) {
             preferences.captureArmed = false
+            preferences.captureResumeRequested = false
             toast("Ion Vendas não encontrado neste aparelho")
             return
         }
-        toast("No Novo Pedido, fique em CABEÇALHO e toque em CAPTURAR 4 PRAZOS")
+        val action = when {
+            preferences.captureResumeRequested -> "RETOMAR ${session?.currentDays} DIAS"
+            preferences.captureMode == AppPreferences.CAPTURE_MODE_SINGLE ->
+                "CAPTURAR ${preferences.captureSingleDays} DIAS"
+            else -> "CAPTURAR 4 PRAZOS"
+        }
+        toast("No Novo Pedido, fique em CABEÇALHO e toque em $action")
         launchingIon = true
         startActivity(launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }

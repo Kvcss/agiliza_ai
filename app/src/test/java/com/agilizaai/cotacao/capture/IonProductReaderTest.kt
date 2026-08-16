@@ -1,6 +1,7 @@
 package com.agilizaai.cotacao.capture
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -230,6 +231,98 @@ class IonProductReaderTest {
 
         assertEquals("7.203333", detail(product("6"), "6,000/6,000").priceForDays(7))
         assertEquals("12.43", detail(product(""), "").priceForDays(7))
+    }
+
+    @Test
+    fun completesTruncatedListBarcodeWithTheFullCodeFromTheDetail() {
+        val list = listOf(
+            node("116.068", "textViewCodigoProduto", 100),
+            node("*EXPOSITOR HAVAIANAS 10 GANCHOS(120 PARES)", "textViewDescricao", 110),
+            node("006192058019...", "textViewCodigoBarras", 130),
+            node("UN", "textViewUnidade", 130),
+            node("1", "textViewEmbalagem", 150),
+            node("364,170", "textViewPrecoTabela", 170),
+            node("54,00", "textViewEstoque", 150)
+        )
+        val product = IonProductReader.readList(list).single()
+        assertEquals("006192058019", product.barcode)
+        assertTrue(product.barcodeTruncated)
+
+        val detail = IonProductReader.readDetail(
+            nodes = listOf(
+                node("116.068", "textViewCodigoProduto", 80),
+                node("*EXPOSITOR HAVAIANAS 10 GANCHOS(120 PARES)", "textViewProduto", 100),
+                node("0061920580192", "textViewCodigoBarras", 140),
+                node("1,000/1,000", "textViewQtUnitCX", 180),
+                node("364,170", "textViewProdutoPrecoTabela", 180),
+                node("UN", "textViewProdutoUN", 220)
+            ),
+            listProduct = product,
+            conditionDays = 7,
+            sourcePackage = "br.com.ionsistemas.ionvendas",
+            capturedAt = 10L
+        )!!
+
+        assertEquals("0061920580192", detail.barcode)
+    }
+
+    @Test
+    fun keepsTheListBarcodeWhenTheDetailShowsADifferentProduct() {
+        val list = listOf(
+            node("44.313", "textViewCodigoProduto", 100),
+            node("*EXPOSITOR HAVAIANAS 20 GANCHOS (240 PARES)", "textViewDescricao", 110),
+            node("0619205802021", "textViewCodigoBarras", 130),
+            node("UN", "textViewUnidade", 130),
+            node("1", "textViewEmbalagem", 150),
+            node("663,386", "textViewPrecoTabela", 170),
+            node("3,00", "textViewEstoque", 150)
+        )
+        val product = IonProductReader.readList(list).single()
+        val detail = IonProductReader.readDetail(
+            nodes = listOf(
+                node("44.313", "textViewCodigoProduto", 80),
+                node("*EXPOSITOR HAVAIANAS 20 GANCHOS (240 PARES)", "textViewProduto", 100),
+                node("7899999999999", "textViewCodigoBarras", 140),
+                node("1,000/1,000", "textViewQtUnitCX", 180),
+                node("663,386", "textViewProdutoPrecoTabela", 180),
+                node("UN", "textViewProdutoUN", 220)
+            ),
+            listProduct = product,
+            conditionDays = 7,
+            sourcePackage = "br.com.ionsistemas.ionvendas",
+            capturedAt = 10L
+        )!!
+
+        assertEquals("0619205802021", detail.barcode)
+    }
+
+    @Test
+    fun flagsConjuntoProductsStraightFromTheList() {
+        val conjunto = IonProductReader.readList(
+            listOf(
+                node("12.345", "textViewCodigoProduto", 100),
+                node("ACHOC NESCAU PO 200G", "textViewDescricao", 110),
+                node("7891000100103", "textViewCodigoBarras", 130),
+                node("CJ", "textViewUnidade", 130),
+                node("6", "textViewEmbalagem", 150),
+                node("59,700", "textViewPrecoTabela", 170),
+                node("40,00", "textViewEstoque", 150)
+            )
+        ).single()
+        assertTrue(conjunto.isConjunto)
+
+        val unidade = IonProductReader.readList(
+            listOf(
+                node("12.346", "textViewCodigoProduto", 100),
+                node("ACHOC NESCAU PO 200G", "textViewDescricao", 110),
+                node("7891000100110", "textViewCodigoBarras", 130),
+                node("UN", "textViewUnidade", 130),
+                node("1", "textViewEmbalagem", 150),
+                node("9,950", "textViewPrecoTabela", 170),
+                node("40,00", "textViewEstoque", 150)
+            )
+        ).single()
+        assertFalse(unidade.isConjunto)
     }
 
     private fun node(text: String, id: String, y: Int) = NodeSnapshot(

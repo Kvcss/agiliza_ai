@@ -39,6 +39,7 @@ class PortalConfigActivity : Activity() {
     private lateinit var barcodeSelector: EditText
     private lateinit var priceSelector: EditText
     private lateinit var advanced: LinearLayout
+    private var cleartextAccepted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -72,14 +73,15 @@ class PortalConfigActivity : Activity() {
         })
 
         val accessCard = card("Acesso")
-        urlField = field("Link HTTPS do portal", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        emailField = field("E-mail ou usuário", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS)
+        urlField = field("Link do portal (ex.: http://177.94.206.10:8081/php/vrcotacao/login.php)", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        emailField = field("Código de acesso", InputType.TYPE_CLASS_TEXT)
         passwordField = field("Senha", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         accessCard.addView(urlField)
         accessCard.addView(emailField)
         accessCard.addView(passwordField)
         accessCard.addView(TextView(this).apply {
-            text = "A senha é protegida por uma chave do Android Keystore e nunca entra no Excel."
+            text = "Cole o link da tela de login. O app preenche Código e Senha e toca em Entrar sozinho.\n" +
+                "A senha é protegida por uma chave do Android Keystore e nunca entra no Excel."
             setTextColor(color(R.color.muted))
             textSize = 12f
             setPadding(dp(3), dp(4), dp(3), dp(5))
@@ -89,7 +91,7 @@ class PortalConfigActivity : Activity() {
 
         val baseCard = card("Base de preços do portal")
         baseCard.addView(TextView(this).apply {
-            text = "Escolha a coleta que será consultada por código de barras. O portal recebe o preço unitário desse prazo."
+            text = "Escolha a coleta que será consultada. O portal recebe o preço unitário desse prazo, cruzado por código de barras, código do produto e nome."
             setTextColor(color(R.color.muted))
             textSize = 13f
             setPadding(0, 0, 0, dp(8))
@@ -120,7 +122,7 @@ class PortalConfigActivity : Activity() {
 
         val mappingCard = card("Mapeamento da página")
         mappingCard.addView(TextView(this).apply {
-            text = "Os seletores abaixo serão ajustados ao site que você enviar. Os valores iniciais funcionam em tabelas HTML comuns."
+            text = "O app identifica sozinho as colunas Código, Código Barra, Descrição e Custo pelos títulos da tabela, e também encontra os campos Código, Senha e Entrar do login pela estrutura da página. Os seletores abaixo são apenas uma primeira tentativa, para portais fora do padrão."
             setTextColor(color(R.color.muted))
             textSize = 13f
             setPadding(0, 0, 0, dp(8))
@@ -133,7 +135,7 @@ class PortalConfigActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
-        userSelector = field("Seletor CSS do usuário")
+        userSelector = field("Seletor CSS do campo Código")
         passwordSelector = field("Seletor CSS da senha")
         submitSelector = field("Seletor CSS do botão Entrar")
         rowSelector = field("Seletor CSS das linhas da cotação")
@@ -145,9 +147,9 @@ class PortalConfigActivity : Activity() {
         root.addView(space(14))
 
         root.addView(primaryButton("SALVAR E ABRIR PORTAL") {
-            if (save()) startActivity(Intent(this, PortalActivity::class.java))
+            attemptSave { startActivity(Intent(this, PortalActivity::class.java)) }
         })
-        root.addView(secondaryButton("SALVAR") { if (save()) finish() })
+        root.addView(secondaryButton("SALVAR") { attemptSave { finish() } })
         root.addView(textButton("Apagar credencial salva") { confirmClearCredentials() })
         root.addView(textButton("Voltar") { finish() })
         return scroll
@@ -170,13 +172,38 @@ class PortalConfigActivity : Activity() {
         if (credentials.password().isNotBlank()) passwordField.hint = "Senha protegida já cadastrada"
     }
 
-    private fun save(): Boolean {
-        val url = urlField.text.toString().trim()
-        val uri = runCatching { URI(url) }.getOrNull()
-        if (uri?.scheme?.lowercase() != "https" || uri.host.isNullOrBlank() || uri.userInfo != null) {
-            toast("Informe um link HTTPS válido")
-            return false
+    /**
+     * Um portal interno sem certificado é aceito, mas o código e a senha trafegam em
+     * texto pela rede. O aviso aparece uma vez por visita, antes de a credencial ser
+     * guardada, para que a escolha seja consciente.
+     */
+    private fun attemptSave(onSaved: () -> Unit) {
+        val uri = PortalUrl.parse(urlField.text.toString())
+        if (uri == null) {
+            toast("Informe um link válido começando com http:// ou https://")
+            return
         }
+        if (PortalUrl.isCleartext(uri) && !cleartextAccepted) {
+            AlertDialog.Builder(this)
+                .setTitle("Portal sem criptografia")
+                .setMessage(
+                    "O link ${uri.host} usa http://, sem HTTPS. O código e a senha vão trafegar " +
+                        "em texto pela rede e podem ser lidos por quem estiver nela.\n\n" +
+                        "Use apenas na rede da empresa. Se o portal tiver um endereço https://, prefira ele."
+                )
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Entendi, continuar") { _, _ ->
+                    cleartextAccepted = true
+                    attemptSave(onSaved)
+                }
+                .show()
+            return
+        }
+        if (save(uri)) onSaved()
+    }
+
+    private fun save(uri: URI): Boolean {
+        val url = urlField.text.toString().trim()
         if (listOf(userSelector, passwordSelector, submitSelector, rowSelector, barcodeSelector, priceSelector).any { it.text.isBlank() }) {
             toast("Os seletores avançados não podem ficar vazios")
             return false
@@ -190,10 +217,10 @@ class PortalConfigActivity : Activity() {
 
         val email = emailField.text.toString().trim()
         val password = passwordField.text.toString()
-        val origin = normalizedOrigin(uri)
+        val origin = PortalUrl.origin(uri)
         val originChanged = credentials.origin().isNotBlank() && credentials.origin() != origin
         if (originChanged && password.isBlank()) {
-            toast("O domínio do portal mudou. Digite a senha novamente por segurança.")
+            toast("O endereço do portal mudou. Digite a senha novamente por segurança.")
             return false
         }
 
@@ -228,11 +255,6 @@ class PortalConfigActivity : Activity() {
                 toast("Credencial apagada")
             }
             .show()
-    }
-
-    private fun normalizedOrigin(uri: URI): String {
-        val port = if (uri.port == -1) 443 else uri.port
-        return "https://${uri.host.lowercase()}:$port"
     }
 
     private fun card(title: String): LinearLayout = LinearLayout(this).apply {

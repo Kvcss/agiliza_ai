@@ -121,6 +121,20 @@ object ScreenScanner {
  * The order screen also exposes its tab ViewPager as scrollable. ACTION_SCROLL_FORWARD on
  * that node means "next tab", not "next products", so broad class/area fallbacks are unsafe.
  */
+/**
+ * Reconhece o prazo exibido pelo ION no cabeçalho do Novo Pedido.
+ *
+ * O texto chega já normalizado (maiúsculas, sem acento). O limite de dígito é o que
+ * impede "28 DIAS" de ser reconhecido dentro de "128 DIAS" e trocar de prazo errado.
+ */
+internal object PaymentPlanPolicy {
+    fun matches(normalizedText: String, days: Int): Boolean =
+        Regex("(?<![0-9])$days DIAS(?![0-9])").containsMatchIn(normalizedText)
+
+    fun matchesAny(normalizedTexts: List<String>, days: Int): Boolean =
+        normalizedTexts.any { matches(it, days) }
+}
+
 internal object ProductScrollTargetPolicy {
     fun priority(viewId: String, className: String, supportsScroll: Boolean): Int {
         if (!supportsScroll) return -1

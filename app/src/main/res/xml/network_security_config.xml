@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    O portal de cotação da distribuidora roda em um servidor interno, num IP da rede
+    com porta própria e sem certificado (http://177.94.206.10:8081/php/vrcotacao/).
+    Sem permitir tráfego em texto claro o WebView recusa a página e a funcionalidade
+    inteira fica inacessível.
+
+    O alcance real continua estreito por outro caminho: o WebView do portal só carrega
+    a origem cadastrada pelo usuário (PortalFillService.isAllowed) e a tela avisa,
+    antes de guardar a senha, quando o endereço não usa HTTPS.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

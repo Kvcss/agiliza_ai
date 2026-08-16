@@ -1,6 +1,7 @@
 package com.agilizaai.cotacao.capture
 
 import com.agilizaai.cotacao.data.QuoteItem
+import com.agilizaai.cotacao.data.isConjuntoUnit
 import com.agilizaai.cotacao.data.toBrazilianDecimalOrNull
 import java.security.MessageDigest
 import kotlin.math.abs
@@ -49,6 +50,12 @@ object IonProductReader {
                 packaging = packaging,
                 unitsPerCase = parseUnitsPerCase(packaging)
             ).stableKey
+
+        /**
+         * `Und: CJ` já aparece na própria lista. Reconhecer aqui evita abrir o detalhe
+         * de um produto que seria descartado, economizando milhares de toques.
+         */
+        val isConjunto: Boolean get() = isConjuntoUnit(unit) || isConjuntoUnit(packaging)
     }
 
     /**
@@ -217,8 +224,13 @@ object IonProductReader {
         val unitsPerCase = parseUnitsPerCase(caseText)
             .ifBlank { parseUnitsPerCase(listProduct.packaging) }
         val packaging = nodes.value(ID_PACKAGING).ifBlank { listProduct.packaging }
-        val barcode = listProduct.barcode
         val salesUnit = nodes.value(ID_DETAIL_UNIT).ifBlank { listProduct.unit }
+        // O detalhe do produto mostra o EAN inteiro. Na lista ele vem cortado com
+        // reticências ("006192058019…"), o que impede o portal de casar o produto.
+        val detailBarcode = resolveDetailBarcode(nodes)
+        val barcode = mergeBarcode(listProduct, detailBarcode)
+        val barcodeTruncated = barcode.isNotBlank() && barcode == listProduct.barcode &&
+            listProduct.barcodeTruncated && detailBarcode.isBlank()
         // Pço Tabela/Valor is the authoritative sale-package price. Dividing it by the
         // confirmed case size keeps Valor Un. consistent with the selected payment term.
         // The list's Preço is used only when ION does not expose a valid case size.
@@ -241,7 +253,7 @@ object IonProductReader {
         val identity = variantIdentity(
             productCode = code,
             barcode = barcode,
-            barcodeTruncated = listProduct.barcodeTruncated,
+            barcodeTruncated = barcodeTruncated,
             description = description,
             packaging = packaging,
             unitsPerCase = unitsPerCase
@@ -277,6 +289,28 @@ object IonProductReader {
     fun isProductDetail(nodes: List<NodeSnapshot>): Boolean =
         nodes.any { it.hasId(ID_DETAIL_PRICE) } || nodes.any { it.hasId(ID_DETAIL_CASE) }
 
+    /**
+     * Chave de retomada de um produto.
+     *
+     * Usa só o que a lista e o detalhe expõem exatamente igual: código, nome e
+     * embalagem. O EAN sai porque a lista o mostra cortado, e a quantidade por caixa
+     * sai porque a lista a deriva da embalagem enquanto o detalhe a lê do campo
+     * próprio. Serve para reconhecer, ao retomar, um produto que já tem preço salvo
+     * neste prazo — sem precisar abri-lo de novo.
+     */
+    internal fun resumeKey(productCode: String, description: String, packaging: String): String =
+        listOf(
+            normalizeIdentifier(productCode),
+            normalizeName(description),
+            normalizeVariantValue(packaging)
+        ).joinToString("|")
+
+    internal fun resumeKey(product: ListProduct): String =
+        resumeKey(product.productCode, product.description, product.packaging)
+
+    internal fun resumeKey(item: QuoteItem): String =
+        resumeKey(item.productCode, item.description, item.packaging)
+
     internal fun variantIdentity(listProduct: ListProduct, item: QuoteItem): VariantIdentity =
         variantIdentity(
             productCode = item.productCode.ifBlank { listProduct.productCode },
@@ -302,6 +336,41 @@ object IonProductReader {
         packaging = normalizeVariantValue(packaging),
         unitsPerCase = normalizeVariantValue(unitsPerCase)
     )
+
+    /**
+     * Procura o EAN completo na tela de detalhe. Além do campo dedicado, aceita
+     * qualquer texto rotulado como código de barras/EAN desde que não esteja cortado.
+     */
+    private fun resolveDetailBarcode(nodes: List<NodeSnapshot>): String {
+        val dedicated = nodes.value(ID_BARCODE)
+        if (dedicated.isNotBlank() && !isTruncated(dedicated)) {
+            dedicated.filter(Char::isDigit).takeIf { it.length in EAN_LENGTHS }?.let { return it }
+        }
+        val labelled = nodes.asSequence()
+            .filterNot { isTruncated(it.text) }
+            .filter { BARCODE_LABEL.containsMatchIn(it.text) }
+            .mapNotNull { BARCODE_LABEL.find(it.text)?.groupValues?.getOrNull(1) }
+            .map { it.filter(Char::isDigit) }
+            .firstOrNull { it.length in EAN_LENGTHS }
+        return labelled.orEmpty()
+    }
+
+    /**
+     * Prefere sempre o código mais confiável: um EAN completo do detalhe substitui o
+     * prefixo lido na lista, mas um valor divergente nunca sobrescreve o original.
+     */
+    private fun mergeBarcode(listProduct: ListProduct, detailBarcode: String): String {
+        val fromList = listProduct.barcode
+        if (detailBarcode.isBlank()) return fromList
+        if (fromList.isBlank()) return detailBarcode
+        if (detailBarcode == fromList) return fromList
+        // Só troca quando o detalhe é uma continuação do que a lista mostrou cortado.
+        return if (listProduct.barcodeTruncated && detailBarcode.startsWith(fromList)) {
+            detailBarcode
+        } else {
+            fromList
+        }
+    }
 
     private fun List<NodeSnapshot>.value(idSuffix: String): String = asSequence()
         .filter { it.hasId(idSuffix) }
@@ -354,10 +423,22 @@ object IonProductReader {
         .trim()
         .replace(Regex("\\s+"), " ")
 
+    /**
+     * Token curto e estável de uma chave de produto. A retomada guarda milhares
+     * desses tokens em disco; o texto completo da chave deixaria o arquivo grande
+     * demais para ser regravado a cada lote.
+     */
+    internal fun shortHash(value: String): String = sha256(value)
+
     private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8))
         .take(12)
         .joinToString("") { "%02x".format(it) }
 
     private const val MIN_DESCRIPTION_PREFIX = 12
+    private val EAN_LENGTHS = 8..14
+    private val BARCODE_LABEL = Regex(
+        "(?:COD(?:IGO)?\\.?\\s*(?:DE\\s*)?BARRAS?|C[OÓ]D\\.?\\s*E(?:MB)?\\.?|EAN)\\s*:?\\s*([0-9][0-9\\s.\\-]*)",
+        RegexOption.IGNORE_CASE
+    )
 }

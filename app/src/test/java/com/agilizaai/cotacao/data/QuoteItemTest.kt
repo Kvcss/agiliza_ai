@@ -93,4 +93,55 @@ class QuoteItemTest {
         assertEquals("2802", legacyStockFromRawCells(listOf("Estoque: 2802.0")))
         assertEquals("CJ", legacySalesUnitFromRawCells(listOf("Unidade: CJ")))
     }
+
+    @Test
+    fun conjuntoProductsNeverEnterTheBase() {
+        val conjunto = base(salesUnit = "CJ")
+        assertTrue(conjunto.hasMinimumStock())
+        assertTrue(conjunto.isExcludedSalesUnit())
+        assertFalse(conjunto.isEligibleForBase())
+
+        // O ION às vezes só marca o conjunto na embalagem.
+        assertTrue(base(salesUnit = "", packaging = "CJ-6").isExcludedSalesUnit())
+        assertTrue(base(salesUnit = "cj").isExcludedSalesUnit())
+    }
+
+    @Test
+    fun regularSalesUnitsStayInTheBase() {
+        assertTrue(base(salesUnit = "UN").isEligibleForBase())
+        assertTrue(base(salesUnit = "CX", packaging = "CX-12").isEligibleForBase())
+        assertTrue(base(salesUnit = "PC").isEligibleForBase())
+        // Estoque insuficiente continua sendo motivo de recusa.
+        assertFalse(base(salesUnit = "UN", stock = "2").isEligibleForBase())
+    }
+
+    @Test
+    fun trimsOversizedRawCellsBeforeStorage() {
+        val noisy = base(salesUnit = "UN").copy(rawCells = List(200) { "campo $it" })
+        assertEquals(QuoteItem.MAX_RAW_CELLS, noisy.withTrimmedRawCells().rawCells.size)
+        assertEquals(3, base(salesUnit = "UN").copy(rawCells = listOf("a", "b", "c")).withTrimmedRawCells().rawCells.size)
+    }
+
+    private fun base(
+        salesUnit: String,
+        packaging: String = "1",
+        stock: String = "10"
+    ) = QuoteItem(
+        id = "id-$salesUnit-$packaging",
+        capturedAt = 1L,
+        conditionDays = 7,
+        sourcePackage = "ion",
+        productCode = "120.561",
+        barcode = "17891000379585",
+        description = "ACHOC NESCAU PO 200G",
+        packaging = packaging,
+        quantity = "6",
+        unitPrice = "5.701",
+        rawCells = emptyList(),
+        pricesByDays = mapOf(7 to "5.701"),
+        unitsPerCase = "6",
+        stock = stock,
+        casePricesByDays = mapOf(7 to "34.206"),
+        salesUnit = salesUnit
+    )
 }

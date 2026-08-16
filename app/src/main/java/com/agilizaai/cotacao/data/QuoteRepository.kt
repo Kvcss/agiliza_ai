@@ -14,15 +14,60 @@ class QuoteRepository(context: Context) {
 
     fun load(): List<QuoteItem> {
         synchronized(PROCESS_LOCK) {
-            return nonEmptyDraftOrNull(read(draftFile, atomicDraftFile))
-                ?: read(dataFile, atomicFile)
-                ?: emptyList()
+            cachedSnapshot()?.let { return it.items }
+            val draft = nonEmptyDraftOrNull(read(draftFile, atomicDraftFile))
+            val items = draft ?: read(dataFile, atomicFile) ?: emptyList()
+            cache = Snapshot(items, draft != null, stamp())
+            return items
+        }
+    }
+
+    /**
+     * Estatísticas da base em uma única passagem. Com 3.000 produtos, contar preço
+     * por prazo quatro vezes na thread principal era o que travava a abertura do app.
+     */
+    fun stats(): QuoteStats {
+        synchronized(PROCESS_LOCK) {
+            val items = load()
+            val hasDraft = cache?.fromDraft == true
+            val perTerm = linkedMapOf<Int, Int>()
+            SUPPORTED_DAYS.forEach { perTerm[it] = 0 }
+            var withPortalBarcode = 0
+            items.forEach { item ->
+                SUPPORTED_DAYS.forEach { days ->
+                    if (item.priceForDays(days).isNotBlank()) perTerm[days] = perTerm.getValue(days) + 1
+                }
+                if (item.barcode.length in 8..14) withPortalBarcode++
+            }
+            return QuoteStats(
+                total = items.size,
+                pricedByDays = perTerm,
+                withPortalBarcode = withPortalBarcode,
+                hasDraft = hasDraft
+            )
         }
     }
 
     fun hasDraft(): Boolean = synchronized(PROCESS_LOCK) {
-        nonEmptyDraftOrNull(read(draftFile, atomicDraftFile)) != null
+        cachedSnapshot()?.let { return it.fromDraft }
+        load()
+        cache?.fromDraft == true
     }
+
+    /** Assinatura barata dos arquivos: evita reler e reparsear um JSON grande sem necessidade. */
+    private fun stamp(): String = buildString {
+        append(if (draftFile.exists()) "${draftFile.lastModified()}:${draftFile.length()}" else "-")
+        append('|')
+        append(if (dataFile.exists()) "${dataFile.lastModified()}:${dataFile.length()}" else "-")
+    }
+
+    private fun cachedSnapshot(): Snapshot? = cache?.takeIf { it.stamp == stamp() }
+
+    private fun invalidate() {
+        cache = null
+    }
+
+    private data class Snapshot(val items: List<QuoteItem>, val fromDraft: Boolean, val stamp: String)
 
     /**
      * Starts a new protected collection. The previous draft becomes the last
@@ -33,6 +78,7 @@ class QuoteRepository(context: Context) {
             val previousDraft = read(draftFile, atomicDraftFile)
             if (!previousDraft.isNullOrEmpty()) write(atomicFile, previousDraft)
             atomicDraftFile.delete()
+            invalidate()
         }
     }
 
@@ -47,6 +93,7 @@ class QuoteRepository(context: Context) {
             } else {
                 write(atomicDraftFile, protectedItems)
             }
+            invalidate()
         }
     }
 
@@ -54,6 +101,7 @@ class QuoteRepository(context: Context) {
         synchronized(PROCESS_LOCK) {
             write(atomicFile, eligible(items))
             atomicDraftFile.delete()
+            invalidate()
         }
     }
 
@@ -61,6 +109,7 @@ class QuoteRepository(context: Context) {
         synchronized(PROCESS_LOCK) {
             atomicFile.delete()
             atomicDraftFile.delete()
+            invalidate()
         }
     }
 
@@ -77,7 +126,9 @@ class QuoteRepository(context: Context) {
 
     private fun write(destination: AtomicFile, items: List<QuoteItem>) {
         val array = JSONArray()
-        items.forEach { array.put(it.toJson()) }
+        // rawCells guarda o texto bruto de cada nó lido no ION. Sem o corte, uma base de
+        // 3.000 produtos passa de dezenas de MB e a leitura trava a abertura do aplicativo.
+        items.forEach { array.put(it.withTrimmedRawCells().toJson()) }
         val stream = destination.startWrite()
         try {
             val writer = stream.writer(Charsets.UTF_8)
@@ -166,8 +217,11 @@ class QuoteRepository(context: Context) {
         )
     }
 
-    /** Missing/unreadable stock is deliberately excluded, just like a value below three. */
-    private fun eligible(items: List<QuoteItem>): List<QuoteItem> = items.filter(QuoteItem::hasMinimumStock)
+    /**
+     * Estoque ausente/ilegível é descartado, assim como um valor abaixo de três.
+     * Produtos vendidos como conjunto (`Und: CJ`) também nunca entram na base.
+     */
+    private fun eligible(items: List<QuoteItem>): List<QuoteItem> = items.filter(QuoteItem::isEligibleForBase)
 
     private fun JSONObject?.toDayPrices(): Map<Int, String> {
         if (this == null) return emptyMap()
@@ -182,6 +236,29 @@ class QuoteRepository(context: Context) {
 
     companion object {
         private val PROCESS_LOCK = Any()
+        private val SUPPORTED_DAYS = listOf(7, 14, 21, 28)
+
+        /**
+         * O serviço de captura e a tela principal vivem no mesmo processo e leem a mesma
+         * base. Um cache compartilhado, validado pela data/tamanho dos arquivos, evita
+         * reparsear milhares de itens a cada `onResume`.
+         */
+        @Volatile
+        private var cache: Snapshot? = null
+    }
+}
+
+/** Resumo pré-calculado da base, para a interface não varrer a lista várias vezes. */
+data class QuoteStats(
+    val total: Int,
+    val pricedByDays: Map<Int, Int>,
+    val withPortalBarcode: Int,
+    val hasDraft: Boolean
+) {
+    fun pricedFor(days: Int): Int = pricedByDays[days] ?: 0
+
+    companion object {
+        val EMPTY = QuoteStats(0, emptyMap(), 0, false)
     }
 }
 

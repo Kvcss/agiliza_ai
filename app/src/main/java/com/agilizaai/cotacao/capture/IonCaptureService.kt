@@ -21,6 +21,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.agilizaai.cotacao.data.AppPreferences
+import com.agilizaai.cotacao.data.CaptureRecovery
+import com.agilizaai.cotacao.data.CaptureSession
+import com.agilizaai.cotacao.data.CaptureSessionStore
 import com.agilizaai.cotacao.data.QuoteItem
 import com.agilizaai.cotacao.data.QuoteRepository
 
@@ -35,6 +38,7 @@ class IonCaptureService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var preferences: AppPreferences
     private lateinit var repository: QuoteRepository
+    private lateinit var sessionStore: CaptureSessionStore
     private lateinit var windowManager: WindowManager
 
     private var overlay: View? = null
@@ -46,6 +50,16 @@ class IonCaptureService : AccessibilityService() {
     private var paused = false
     private var phase = Phase.IDLE
     private var phaseAttempts = 0
+
+    /**
+     * Prazos desta coleta. Pode ser a sequência completa ou uma única categoria
+     * escolhida na tela inicial.
+     */
+    private var conditions: List<Int> = AppPreferences.CAPTURE_DAYS
+    private var sessionStartedAt = 0L
+    private var resumedSession = false
+    private var pendingResume: CaptureSession? = null
+    private var pendingResumeLoaded = false
     private var conditionIndex = 0
     private var pageCount = 0
     private var unchangedPages = 0
@@ -55,9 +69,35 @@ class IonCaptureService : AccessibilityService() {
     private var currentProduct: IonProductReader.ListProduct? = null
     private var outsideTargetChecks = 0
     private val visitedInCondition = linkedSetOf<String>()
+
+    /**
+     * Produtos que já têm preço salvo no prazo atual. Ao retomar, é o que permite
+     * pular o que já foi lido mesmo quando a lista de visitados se perdeu junto com
+     * o aplicativo — ou nunca chegou a existir.
+     */
+    private val alreadyPricedInCondition = hashSetOf<String>()
     private val conditionCounts = linkedMapOf<Int, Int>()
     private val capturedItems = LinkedHashMap<String, QuoteItem>()
     private val capturedIdentities = LinkedHashMap<String, IonProductReader.VariantIdentity>()
+
+    /**
+     * Guarda se o plano do prazo atual foi realmente escolhido. Sem isso o serviço
+     * podia cair do cabeçalho direto para a TABELA e gravar os preços de 7 dias
+     * como se fossem de 14, 21 ou 28.
+     */
+    private var planSelectionClicked = false
+
+    /**
+     * `moveTo` zera `phaseAttempts`, então o vaivém cabeçalho ↔ lista de planos
+     * não é limitado por ele. Este contador é o que garante que a troca de prazo
+     * desiste em vez de ficar em laço eterno.
+     */
+    private var planAttempts = 0
+    private var listResetAttempts = 0
+    private var lastListSignature = ""
+    private var skippedConjunto = 0
+    private var pendingDraftWrites = 0
+    private var lastDraftWriteAt = 0L
 
     private val advanceRunnable = Runnable(::advance)
     private val visibilityRunnable = object : Runnable {
@@ -82,7 +122,11 @@ class IonCaptureService : AccessibilityService() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.getStringExtra(AppPreferences.EXTRA_COMMAND)) {
                 AppPreferences.COMMAND_STOP -> cancelCapture("Captura encerrada")
-                else -> refreshOverlayVisibility()
+                else -> {
+                    // A tela inicial acabou de definir o plano/retomada desta coleta.
+                    invalidatePendingResume()
+                    refreshOverlayVisibility()
+                }
             }
         }
     }
@@ -91,6 +135,7 @@ class IonCaptureService : AccessibilityService() {
         super.onServiceConnected()
         preferences = AppPreferences(this)
         repository = QuoteRepository(this)
+        sessionStore = CaptureSessionStore(this)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         serviceInfo = serviceInfo.apply { packageNames = arrayOf(preferences.targetPackage) }
         val filter = IntentFilter(AppPreferences.ACTION_CAPTURE_COMMAND)
@@ -130,7 +175,65 @@ class IonCaptureService : AccessibilityService() {
 
     private fun refreshOverlayVisibility(currentPackage: String = preferences.lastSeenPackage) {
         val shouldShow = preferences.captureArmed && currentPackage == preferences.targetPackage
-        if (shouldShow) showOverlay() else if (!scanning) removeOverlay()
+        if (shouldShow) {
+            showOverlay()
+            // O plano pode ter mudado na tela inicial enquanto o balão já estava
+            // visível: o rótulo precisa refletir o que o toque realmente fará.
+            if (!scanning) {
+                overlayAction?.text = pendingActionLabel()
+                overlayStatus?.text = pendingActionHint()
+            }
+        } else if (!scanning) {
+            removeOverlay()
+        }
+    }
+
+    /** Descreve o que o botão do balão fará: coleta nova, prazo único ou retomada. */
+    private fun pendingActionLabel(): String {
+        pendingResumeSession()?.let { return "RETOMAR ${it.currentDays} DIAS" }
+        val planned = preferences.plannedConditions()
+        return if (planned.size == 1) "CAPTURAR ${planned.first()} DIAS" else "CAPTURAR ${planned.size} PRAZOS"
+    }
+
+    private fun pendingActionHint(): String {
+        val resume = pendingResumeSession()
+        if (resume != null) {
+            val afterCurrent = resume.remainingConditions.drop(1).joinToString(", ") { "$it" }
+            return "Retomar ${resume.currentDays} dias · ${resume.readInCurrentCondition} já lidos" +
+                if (afterCurrent.isNotBlank()) "\nDepois: $afterCurrent dias" else ""
+        }
+        val planned = preferences.plannedConditions()
+        val plan = if (planned.size == 1) "${planned.first()} dias" else planned.joinToString(", ") { "$it" }
+        return "No cabeçalho do Novo Pedido, toque abaixo\nPlano desta coleta: $plan"
+    }
+
+    /**
+     * Sessão interrompida que o usuário pediu para continuar, se houver.
+     *
+     * O balão é reavaliado a cada evento de acessibilidade, então o arquivo é lido
+     * uma vez só e guardado até a tela inicial anunciar uma mudança.
+     */
+    private fun pendingResumeSession(): CaptureSession? {
+        if (!preferences.captureResumeRequested) return null
+        if (!pendingResumeLoaded) {
+            pendingResume = runCatching { sessionStore.resumable() }.getOrNull()
+                // Coleta interrompida antes de existir arquivo de sessão: o ponto de
+                // retomada ainda pode ser deduzido dos preços já salvos.
+                ?: runCatching {
+                    if (!preferences.captureWasInterrupted) null else CaptureRecovery.deduce(
+                        pricedByDays = repository.stats().pricedByDays,
+                        conditions = AppPreferences.CAPTURE_DAYS,
+                        updatedAt = preferences.lastCaptureSavedAt
+                    )
+                }.getOrNull()
+            pendingResumeLoaded = true
+        }
+        return pendingResume
+    }
+
+    private fun invalidatePendingResume() {
+        pendingResume = null
+        pendingResumeLoaded = false
     }
 
     private fun showOverlay() {
@@ -152,7 +255,7 @@ class IonCaptureService : AccessibilityService() {
             gravity = Gravity.CENTER
         }
         overlayStatus = TextView(this).apply {
-            text = "No cabeçalho do Novo Pedido, toque abaixo"
+            text = pendingActionHint()
             setTextColor(Color.WHITE)
             textSize = 13f
             gravity = Gravity.CENTER
@@ -162,7 +265,7 @@ class IonCaptureService : AccessibilityService() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        overlayAction = actionText("CAPTURAR 4 PRAZOS") {
+        overlayAction = actionText(pendingActionLabel()) {
             if (!scanning) startCapture() else togglePause()
         }
         val close = actionText("FECHAR") {
@@ -235,18 +338,33 @@ class IonCaptureService : AccessibilityService() {
             return
         }
 
-        val storageReady = runCatching { repository.beginNewCapture() }.isSuccess
-        if (!storageReady) {
-            overlayStatus?.text = "Não consegui preparar o salvamento automático"
-            Toast.makeText(this, "Falha ao preparar o armazenamento da coleta", Toast.LENGTH_LONG).show()
-            return
+        val resumeSession = pendingResumeSession()
+        // A retomada não pode chamar beginNewCapture: isso promoveria o rascunho e
+        // apagaria justamente os produtos que ela precisa continuar preenchendo.
+        if (resumeSession == null) {
+            val storageReady = runCatching { repository.beginNewCapture() }.isSuccess
+            if (!storageReady) {
+                overlayStatus?.text = "Não consegui preparar o salvamento automático"
+                Toast.makeText(this, "Falha ao preparar o armazenamento da coleta", Toast.LENGTH_LONG).show()
+                return
+            }
         }
+        val plannedConditions = preferences.plannedConditions()
+        val session = resumeSession ?: CaptureSession(
+            conditions = plannedConditions,
+            startedAt = System.currentTimeMillis()
+        )
+        preferences.captureResumeRequested = false
+        invalidatePendingResume()
 
         scanning = true
         paused = false
+        resumedSession = resumeSession != null
         phase = Phase.OPEN_PLAN
         phaseAttempts = 0
-        conditionIndex = 0
+        conditions = session.conditions.ifEmpty { AppPreferences.CAPTURE_DAYS }
+        sessionStartedAt = session.startedAt
+        conditionIndex = session.conditionIndex.coerceIn(0, conditions.lastIndex)
         pageCount = 0
         unchangedPages = 0
         lastFingerprint = ""
@@ -254,15 +372,74 @@ class IonCaptureService : AccessibilityService() {
         scrollLoadChecks = 0
         currentProduct = null
         visitedInCondition.clear()
+        visitedInCondition += session.visitedKeys
         conditionCounts.clear()
+        conditionCounts.putAll(session.conditionCounts)
         capturedItems.clear()
         capturedIdentities.clear()
+        restoreCapturedBase(resume = resumeSession != null, plannedConditions = plannedConditions)
+        refreshAlreadyPriced()
+        planSelectionClicked = false
+        planAttempts = 0
+        listResetAttempts = 0
+        lastListSignature = ""
+        skippedConjunto = session.skippedConjunto
+        pendingDraftWrites = 0
+        lastDraftWriteAt = 0L
         preferences.captureStatus = AppPreferences.CAPTURE_IN_PROGRESS
-        preferences.captureStatusMessage = "Capturando as tabelas de 7, 14, 21 e 28 dias"
+        preferences.captureStatusMessage = if (resumedSession) {
+            "Retomando a tabela de ${currentDays()} dias"
+        } else {
+            "Capturando ${conditions.joinToString(", ") { "$it" }} dias"
+        }
+        sessionStore.save(currentSession())
         overlayAction?.text = "PAUSAR"
         setCaptureScreenOn(true)
-        updateOverlay("Preparando 7 dias", "0 produtos")
+        val opening = if (resumedSession) "Retomando ${currentDays()} dias" else "Preparando ${currentDays()} dias"
+        updateOverlay(opening, progressText())
         scheduleAdvance(200L)
+    }
+
+    /**
+     * Recarrega o que já está salvo para dentro da coleta atual.
+     *
+     * Sem isso, retomar gravaria um rascunho contendo apenas os produtos lidos depois
+     * da falha, e capturar um único prazo apagaria os preços dos outros três.
+     */
+    private fun restoreCapturedBase(resume: Boolean, plannedConditions: List<Int>) {
+        // Retomar sempre parte do que existe: gravar um rascunho sem os produtos já
+        // lidos apagaria a coleta anterior ao final da captura.
+        val shouldRestore = resume || plannedConditions.size == 1
+        if (!shouldRestore) return
+        val items = runCatching { repository.load() }.getOrDefault(emptyList())
+        items.forEach { item ->
+            val identity = IonProductReader.variantIdentity(
+                productCode = item.productCode,
+                barcode = item.barcode,
+                barcodeTruncated = false,
+                description = item.description,
+                packaging = item.packaging,
+                unitsPerCase = item.unitsPerCase.ifBlank { item.quantity }
+            )
+            val key = identity.stableKey
+            capturedItems[key] = capturedItems[key]?.let { mergeProduct(it, item) } ?: item
+            capturedIdentities[key] = capturedIdentities[key]?.mergedWith(identity) ?: identity
+        }
+    }
+
+    /**
+     * Recalcula, para o prazo atual, quais produtos já têm preço gravado. Só vale numa
+     * retomada: numa coleta nova o objetivo é justamente reler todos os preços.
+     */
+    private fun refreshAlreadyPriced() {
+        alreadyPricedInCondition.clear()
+        if (!resumedSession) return
+        val days = currentDays()
+        capturedItems.values.forEach { item ->
+            if (item.priceForDays(days).isNotBlank()) {
+                alreadyPricedInCondition += IonProductReader.resumeKey(item)
+            }
+        }
     }
 
     private fun togglePause() {
@@ -270,6 +447,7 @@ class IonCaptureService : AccessibilityService() {
         paused = !paused
         if (paused) {
             handler.removeCallbacks(advanceRunnable)
+            if (capturedItems.isNotEmpty()) persistCurrentDraft(force = true)
             overlayAction?.text = "CONTINUAR"
             setCaptureScreenOn(false)
             updateOverlay("Captura pausada", progressText())
@@ -295,6 +473,7 @@ class IonCaptureService : AccessibilityService() {
                 Phase.OPEN_PLAN -> openPaymentPlan(root, nodes)
                 Phase.CHOOSE_PLAN -> choosePaymentPlan(root, nodes)
                 Phase.OPEN_TABLE -> openProductTable(root, nodes)
+                Phase.RESET_LIST -> resetListToTop(root, nodes)
                 Phase.SCAN_LIST -> scanProductList(root, nodes)
                 Phase.WAIT_DETAIL -> waitForDetail(nodes)
                 Phase.READ_DETAIL -> readProductDetail(nodes)
@@ -311,13 +490,25 @@ class IonCaptureService : AccessibilityService() {
         when {
             isPaymentPlanList(nodes) -> moveTo(Phase.CHOOSE_PLAN)
             !isOrderHeader(nodes) -> retryOrAbort("Não encontrei o cabeçalho do Novo Pedido")
+            // O cabeçalho já exibe exatamente este prazo: não há o que trocar.
+            headerShowsPlan(nodes, currentDays()) -> {
+                planSelectionClicked = true
+                updateOverlay("Plano de ${currentDays()} dias já ativo", progressText())
+                moveTo(Phase.OPEN_TABLE)
+            }
             // ION Vendas 1.26.7 exposes the selected plan itself as the
             // clickable control. Older versions expose one of the row IDs.
+            planAttempts >= MAX_PLAN_ATTEMPTS ->
+                abortCapture(
+                    "Não consegui trocar para o plano de ${currentDays()} dias",
+                    AppPreferences.CAPTURE_ABORTED
+                )
             clickById(root, "buttonSelecionarPlPag") ||
                 clickById(root, "imageButtonConfiguracoesPlanoPagamento") ||
                 clickById(root, "linhaPlanoPagamento") ||
                 clickById(root, "linhaDadosPlanoPagamento") ||
                 clickTextExact(root, "Plano de pagamento") -> {
+                planAttempts++
                 updateOverlay("Selecionando ${currentDays()} dias", progressText())
                 moveTo(Phase.CHOOSE_PLAN, ACTION_SETTLE_MS)
             }
@@ -327,7 +518,19 @@ class IonCaptureService : AccessibilityService() {
 
     private fun choosePaymentPlan(root: AccessibilityNodeInfo, nodes: List<NodeSnapshot>) {
         if (isOrderHeader(nodes)) {
-            moveTo(Phase.OPEN_TABLE)
+            // A lista de planos ainda não apareceu (ou fechou sozinha). Avançar aqui era
+            // o que fazia o serviço reler a tabela do prazo anterior com o rótulo errado.
+            when {
+                headerShowsPlan(nodes, currentDays()) -> {
+                    planSelectionClicked = true
+                    moveTo(Phase.OPEN_TABLE)
+                }
+                planSelectionClicked -> moveTo(Phase.OPEN_TABLE)
+                else -> {
+                    updateOverlay("Reabrindo os planos de pagamento", progressText())
+                    moveTo(Phase.OPEN_PLAN, ACTION_SETTLE_MS)
+                }
+            }
             return
         }
         if (!isPaymentPlanList(nodes)) {
@@ -336,6 +539,8 @@ class IonCaptureService : AccessibilityService() {
         }
         val label = "${currentDays()} DIAS"
         if (clickTextExact(root, label)) {
+            planSelectionClicked = true
+            planAttempts = 0
             updateOverlay("Plano $label selecionado", progressText())
             moveTo(Phase.OPEN_TABLE, ACTION_SETTLE_MS)
         } else {
@@ -344,14 +549,81 @@ class IonCaptureService : AccessibilityService() {
     }
 
     private fun openProductTable(root: AccessibilityNodeInfo, nodes: List<NodeSnapshot>) {
+        if (!planSelectionClicked) {
+            // Nunca ler uma tabela sem ter confirmado de qual prazo ela é.
+            updateOverlay("Confirmando o plano de ${currentDays()} dias", progressText())
+            moveTo(Phase.OPEN_PLAN, ACTION_SETTLE_MS)
+            return
+        }
         when {
-            IonProductReader.isProductList(nodes) -> moveTo(Phase.SCAN_LIST)
+            IonProductReader.isProductList(nodes) -> moveTo(Phase.RESET_LIST)
             isOrderTabScreen(nodes) && clickTextExact(root, "TABELA") -> {
                 updateOverlay("Abrindo tabela de ${currentDays()} dias", progressText())
-                moveTo(Phase.SCAN_LIST, ACTION_SETTLE_MS)
+                moveTo(Phase.RESET_LIST, ACTION_SETTLE_MS)
             }
             else -> retryOrAbort("Não encontrei a aba TABELA")
         }
+    }
+
+    /**
+     * Ao trocar de prazo o ION mantém a rolagem onde estava. Sem voltar ao topo, o
+     * prazo seguinte começaria no fim da lista e perderia todos os produtos acima.
+     */
+    private fun resetListToTop(root: AccessibilityNodeInfo, nodes: List<NodeSnapshot>) {
+        if (!IonProductReader.isProductList(nodes)) {
+            retryOrAbort("A lista de produtos não está visível para voltar ao topo")
+            return
+        }
+        val signature = listSignature(nodes)
+        if (listResetAttempts >= MAX_LIST_RESET_SCROLLS ||
+            (listResetAttempts > 0 && signature == lastListSignature)
+        ) {
+            lastListSignature = ""
+            listResetAttempts = 0
+            updateOverlay("Tabela de ${currentDays()} dias no topo", progressText())
+            moveTo(Phase.SCAN_LIST, LIST_STABILITY_MS)
+            return
+        }
+        val scrollable = ScreenScanner.findBestScrollable(root)
+        if (scrollable == null) {
+            listResetAttempts = 0
+            moveTo(Phase.SCAN_LIST, LIST_STABILITY_MS)
+            return
+        }
+        val moved = runCatching {
+            // Caminho rápido: pular direto para a primeira linha em vez de rolar
+            // centenas de páginas para trás numa tabela de 3.000 produtos.
+            val jumped = listResetAttempts == 0 && scrollable.actionList.any {
+                it.id == AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_TO_POSITION.id
+            } && scrollable.performAction(
+                AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_TO_POSITION.id,
+                android.os.Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_ROW_INT, 0)
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_COLUMN_INT, 0)
+                }
+            )
+            if (jumped) return@runCatching true
+            val supportsScrollUp = scrollable.actionList.any {
+                it.id == AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.id
+            }
+            val action = if (supportsScrollUp) {
+                AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.id
+            } else {
+                AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            }
+            scrollable.performAction(action)
+        }.getOrDefault(false)
+        scrollable.recycle()
+        lastListSignature = signature
+        if (!moved) {
+            listResetAttempts = 0
+            lastListSignature = ""
+            moveTo(Phase.SCAN_LIST, LIST_STABILITY_MS)
+            return
+        }
+        listResetAttempts++
+        updateOverlay("Voltando ao início de ${currentDays()} dias", "rolagem $listResetAttempts")
+        scheduleAdvance(SCROLL_SETTLE_MS)
     }
 
     private fun scanProductList(root: AccessibilityNodeInfo, nodes: List<NodeSnapshot>) {
@@ -383,7 +655,35 @@ class IonCaptureService : AccessibilityService() {
         }
 
         val products = IonProductReader.readList(nodes)
-        val next = products.firstOrNull { it.stableKey !in visitedInCondition }
+
+        // Produtos em conjunto (Und: CJ) não entram na base. Descartá-los aqui evita
+        // abrir o detalhe à toa — com 3.000 itens por tabela isso economiza muito tempo.
+        val conjuntos = products.filter { it.isConjunto && visitToken(it) !in visitedInCondition }
+        if (conjuntos.isNotEmpty()) {
+            conjuntos.forEach { visitedInCondition += visitToken(it) }
+            skippedConjunto += conjuntos.size
+            unchangedPages = 0
+            pendingScrollFingerprint = null
+            scrollLoadChecks = 0
+            updateOverlay("${conjuntos.size} conjunto(s) ignorado(s)", progressText())
+            scheduleAdvance(150L)
+            return
+        }
+
+        // Numa retomada, o produto que já tem preço deste prazo entra direto para os
+        // visitados: é o que faz a captura pular horas de leitura já feita.
+        val resumed = products.filter { alreadyRead(it) && visitToken(it) !in visitedInCondition }
+        if (resumed.isNotEmpty()) {
+            resumed.forEach { visitedInCondition += visitToken(it) }
+            unchangedPages = 0
+            pendingScrollFingerprint = null
+            scrollLoadChecks = 0
+            updateOverlay("${resumed.size} já lido(s) neste prazo", progressText())
+            scheduleAdvance(120L)
+            return
+        }
+
+        val next = products.firstOrNull { visitToken(it) !in visitedInCondition }
         if (next != null) {
             pendingScrollFingerprint = null
             scrollLoadChecks = 0
@@ -393,13 +693,13 @@ class IonCaptureService : AccessibilityService() {
                 updateOverlay("Lendo ${currentDays()} dias", "${visitedInCondition.size} lidos · ${next.description.take(28)}")
                 moveTo(Phase.WAIT_DETAIL, PRODUCT_OPEN_MS)
             } else {
-                visitedInCondition += next.stableKey
+                visitedInCondition += visitToken(next)
                 retryOrAbort("Não consegui abrir ${next.productCode}")
             }
             return
         }
 
-        val fingerprint = ScreenScanner.fingerprint(nodes)
+        val fingerprint = listSignature(nodes)
         val beforeScroll = pendingScrollFingerprint
         if (beforeScroll != null) {
             if (fingerprint != beforeScroll) {
@@ -503,17 +803,19 @@ class IonCaptureService : AccessibilityService() {
 
         val identity = IonProductReader.variantIdentity(listProduct, item)
         val exactKey = identity.stableKey
-        val compatibleKey = capturedIdentities.entries
-            .asSequence()
-            .filter { (_, existingIdentity) -> existingIdentity.isCompatibleWith(identity) }
-            .map { it.key }
-            .singleOrNull()
-        val key = when {
-            capturedItems.containsKey(exactKey) -> exactKey
-            compatibleKey != null -> compatibleKey
-            else -> exactKey
+        // A varredura por variante compatível percorre a base inteira. Com milhares de
+        // produtos já lidos ela só compensa quando a chave exata ainda não existe.
+        val key = if (capturedItems.containsKey(exactKey)) {
+            exactKey
+        } else {
+            capturedIdentities.entries
+                .asSequence()
+                .filter { (_, existingIdentity) -> existingIdentity.isCompatibleWith(identity) }
+                .map { it.key }
+                .singleOrNull()
+                ?: exactKey
         }
-        val eligibleStock = item.hasMinimumStock()
+        val eligibleStock = item.isEligibleForBase()
         if (eligibleStock) {
             capturedItems[key] = mergeProduct(capturedItems[key], item)
             capturedIdentities[key] = capturedIdentities[key]?.mergedWith(identity) ?: identity
@@ -527,13 +829,16 @@ class IonCaptureService : AccessibilityService() {
             abortCapture("Não consegui salvar o rascunho no aparelho", AppPreferences.CAPTURE_ABORTED)
             return
         }
-        visitedInCondition += listProduct.stableKey
+        visitedInCondition += visitToken(listProduct)
         currentProduct = null
         conditionCounts[currentDays()] = visitedInCondition.size
-        val stockStatus = if (eligibleStock) {
-            "produto gravado · estoque ${item.stock}"
-        } else {
-            "ignorado · estoque abaixo de 3 ou ilegível"
+        val stockStatus = when {
+            eligibleStock -> "produto gravado · estoque ${item.stock}"
+            item.isExcludedSalesUnit() -> {
+                skippedConjunto++
+                "ignorado · conjunto (Und: CJ) não entra na base"
+            }
+            else -> "ignorado · estoque abaixo de 3 ou ilegível"
         }
         updateOverlay("${currentDays()} dias · $stockStatus", progressText())
 
@@ -555,30 +860,67 @@ class IonCaptureService : AccessibilityService() {
 
     private fun finishCondition() {
         conditionCounts[currentDays()] = visitedInCondition.size
-        if (conditionIndex == CONDITIONS.lastIndex) {
+        // Grava o que foi lido neste prazo antes de trocar de plano.
+        persistCurrentDraft(force = true)
+        if (conditionIndex == conditions.lastIndex) {
             finishCapture()
             return
         }
+        val completedDays = currentDays()
         conditionIndex++
         visitedInCondition.clear()
+        refreshAlreadyPriced()
         currentProduct = null
         pageCount = 0
         unchangedPages = 0
         lastFingerprint = ""
         pendingScrollFingerprint = null
         scrollLoadChecks = 0
-        updateOverlay("${CONDITIONS[conditionIndex - 1]} dias concluído", "Próximo: ${currentDays()} dias")
+        // O próximo prazo precisa ser escolhido do zero no cabeçalho.
+        planSelectionClicked = false
+        planAttempts = 0
+        listResetAttempts = 0
+        lastListSignature = ""
+        // O novo prazo começa com a lista de visitados vazia: gravar a sessão aqui é
+        // o que faz a retomada continuar no prazo certo em vez de repetir o anterior.
+        sessionStore.save(currentSession())
+        updateOverlay("$completedDays dias concluído", "Próximo: ${currentDays()} dias")
         moveTo(Phase.RETURN_HEADER, 250L)
     }
 
     private fun returnToHeader(root: AccessibilityNodeInfo, nodes: List<NodeSnapshot>) {
         when {
             isOrderHeader(nodes) -> moveTo(Phase.OPEN_PLAN)
-            clickTextExact(root, "CABEÇALHO") -> {
+            clickTextExact(root, "CABEÇALHO") || clickTabByPrefix(root, "CABE") -> {
                 updateOverlay("Voltando ao cabeçalho", "Preparando ${currentDays()} dias")
                 moveTo(Phase.OPEN_PLAN, ACTION_SETTLE_MS)
             }
             else -> retryOrAbort("Não encontrei a aba CABEÇALHO")
+        }
+    }
+
+    /**
+     * A barra de abas do Novo Pedido rola na horizontal e o CABEÇALHO costuma ficar
+     * cortado ("...LHO"). Este atalho encontra a aba pelo início do nome, inclusive
+     * quando o rótulo visível foi truncado pelo próprio ION.
+     */
+    private fun clickTabByPrefix(root: AccessibilityNodeInfo, prefix: String): Boolean {
+        val normalizedPrefix = normalize(prefix)
+        val nodes = ScreenScanner.snapshot(root, preferences.targetPackage)
+        val target = nodes.firstOrNull {
+            val text = normalize(it.text)
+            text.startsWith(normalizedPrefix) || normalizedPrefix.startsWith(text) && text.length >= 3
+        } ?: return false
+        val candidates = root.findAccessibilityNodeInfosByText(target.text)
+        return try {
+            candidates.asSequence()
+                .mapNotNull { clickableCopy(it) }
+                .firstOrNull()
+                ?.let { clickable ->
+                    try { clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK) } finally { clickable.recycle() }
+                } == true
+        } finally {
+            candidates.forEach { it.recycle() }
         }
     }
 
@@ -590,7 +932,7 @@ class IonCaptureService : AccessibilityService() {
         handler.removeCallbacks(advanceRunnable)
         preferences.captureArmed = false
         val items = capturedItems.values.toList()
-        val completeConditions = CONDITIONS.all { conditionCounts.containsKey(it) }
+        val completeConditions = conditions.all { conditionCounts.containsKey(it) }
         val result = runCatching {
             check(items.isNotEmpty()) { "Nenhum produto foi reconhecido" }
             check(completeConditions) { "Nem todos os prazos foram concluídos" }
@@ -598,8 +940,16 @@ class IonCaptureService : AccessibilityService() {
             preferences.lastCaptureSavedAt = System.currentTimeMillis()
             preferences.lastCaptureSavedCount = items.size
         }
+        // Não há mais o que retomar: a sessão pendente precisa sair do caminho para a
+        // tela inicial não oferecer a continuação de uma coleta já encerrada.
+        sessionStore.clear()
+        val finishedPlan = if (conditions.size == 1) {
+            "${conditions.first()} dias concluído"
+        } else {
+            "${conditions.size} prazos concluídos"
+        }
         val message = result.fold(
-            onSuccess = { "${items.size} produtos · 4 prazos concluídos" },
+            onSuccess = { "${items.size} produtos · $finishedPlan" },
             onFailure = {
                 val reason = it.message ?: "Não foi possível finalizar a captura"
                 if (repository.hasDraft()) {
@@ -621,7 +971,10 @@ class IonCaptureService : AccessibilityService() {
     private fun cancelCapture(message: String) {
         handler.removeCallbacksAndMessages(null)
         val hadCurrentItems = capturedItems.isNotEmpty()
-        if (hadCurrentItems) persistCurrentDraft()
+        if (hadCurrentItems) persistCurrentDraft(force = true)
+        // Fechar o app no meio da tabela é justamente o caso que a retomada resolve:
+        // o ponto exato da coleta fica gravado antes de o serviço soltar o estado.
+        if (scanning) runCatching { sessionStore.save(currentSession()) }
         scanning = false
         paused = false
         setCaptureScreenOn(false)
@@ -642,7 +995,8 @@ class IonCaptureService : AccessibilityService() {
     private fun abortCapture(message: String, status: String) {
         if (!scanning) return
         handler.removeCallbacks(advanceRunnable)
-        if (capturedItems.isNotEmpty()) persistCurrentDraft()
+        if (capturedItems.isNotEmpty()) persistCurrentDraft(force = true)
+        runCatching { sessionStore.save(currentSession()) }
         scanning = false
         paused = false
         setCaptureScreenOn(false)
@@ -684,22 +1038,60 @@ class IonCaptureService : AccessibilityService() {
         handler.postDelayed(advanceRunnable, delay)
     }
 
-    private fun currentDays(): Int = CONDITIONS[conditionIndex]
+    private fun currentDays(): Int = conditions.getOrElse(conditionIndex) { conditions.last() }
+
+    /** Token curto e estável de um produto da lista, do tamanho que cabe em disco. */
+    private fun visitToken(product: IonProductReader.ListProduct): String =
+        IonProductReader.shortHash(product.stableKey)
+
+    /** O produto já tem preço gravado no prazo que está sendo lido agora. */
+    private fun alreadyRead(product: IonProductReader.ListProduct): Boolean =
+        alreadyPricedInCondition.isNotEmpty() &&
+            IonProductReader.resumeKey(product) in alreadyPricedInCondition
+
+    private fun currentSession(now: Long = System.currentTimeMillis()) = CaptureSession(
+        conditions = conditions,
+        conditionIndex = conditionIndex,
+        visitedKeys = LinkedHashSet(visitedInCondition),
+        conditionCounts = LinkedHashMap(conditionCounts),
+        skippedConjunto = skippedConjunto,
+        startedAt = sessionStartedAt,
+        updatedAt = now
+    )
 
     private fun progressText(): String {
-        val terms = CONDITIONS.joinToString(" ") { days ->
+        val terms = conditions.joinToString(" ") { days ->
             if (days == currentDays()) "[$days]" else days.toString()
         }
         val saved = if (capturedItems.isNotEmpty()) " · ✓ salvo" else ""
-        return "$terms · ${visitedInCondition.size} neste prazo · ${capturedItems.size} produtos$saved"
+        val conjuntos = if (skippedConjunto > 0) " · $skippedConjunto CJ fora" else ""
+        return "$terms · ${visitedInCondition.size} neste prazo · ${capturedItems.size} produtos$conjuntos$saved"
     }
 
-    private fun persistCurrentDraft(): Boolean {
+    /**
+     * Regravar a base inteira a cada produto é O(n²): no fim de uma tabela de 3.000
+     * itens cada leitura reserializava 3.000 registros e a captura arrastava. O
+     * rascunho agora é gravado em lotes, e sempre de forma completa nos pontos
+     * críticos (fim de prazo, pausa, cancelamento e conclusão).
+     */
+    private fun persistCurrentDraft(force: Boolean = false): Boolean {
+        pendingDraftWrites++
+        val now = System.currentTimeMillis()
+        val due = force ||
+            pendingDraftWrites >= DRAFT_WRITE_EVERY ||
+            now - lastDraftWriteAt >= DRAFT_WRITE_INTERVAL_MS
+        if (!due) return true
         val snapshot = capturedItems.values.toList()
         return runCatching {
             repository.replaceDraft(snapshot)
+            // A sessão é gravada depois do rascunho de propósito. Se o aplicativo cair
+            // entre as duas gravações, a retomada relê alguns produtos — o inverso
+            // marcaria como lido algo que nunca chegou ao disco.
+            sessionStore.save(currentSession(now))
+            pendingDraftWrites = 0
+            lastDraftWriteAt = now
             if (snapshot.isNotEmpty()) {
-                preferences.lastCaptureSavedAt = System.currentTimeMillis()
+                preferences.lastCaptureSavedAt = now
                 preferences.lastCaptureSavedCount = snapshot.size
                 preferences.captureStatusMessage = "Rascunho protegido · ${snapshot.size} produtos"
             } else {
@@ -765,7 +1157,24 @@ class IonCaptureService : AccessibilityService() {
 
     private fun isPaymentPlanList(nodes: List<NodeSnapshot>): Boolean =
         nodes.any { normalize(it.text).contains("SELECIONAR PL PAGAMENTO") } ||
-            CONDITIONS.count { days -> nodes.any { normalize(it.text) == "$days DIAS" } } >= 3
+            ALL_CONDITIONS.count { days -> nodes.any { normalize(it.text) == "$days DIAS" } } >= 3
+
+    /**
+     * O cabeçalho mostra o plano ativo. Serve para confirmar a troca de prazo sem
+     * depender só do clique ter dado certo. Exige limite de palavra para que
+     * "28 DIAS" nunca seja reconhecido dentro de "128 DIAS".
+     */
+    private fun headerShowsPlan(nodes: List<NodeSnapshot>, days: Int): Boolean {
+        if (isPaymentPlanList(nodes)) return false
+        return PaymentPlanPolicy.matchesAny(nodes.map { normalize(it.text) }, days)
+    }
+
+    /**
+     * Assinatura só dos produtos visíveis. O fingerprint da tela inteira mudava com o
+     * total do pedido e com as imagens carregando, e o fim da lista nunca era aceito.
+     */
+    private fun listSignature(nodes: List<NodeSnapshot>): String =
+        IonProductReader.readList(nodes).joinToString("|") { it.stableKey }
 
     private fun clickById(root: AccessibilityNodeInfo, idSuffix: String): Boolean {
         val nodes = root.findAccessibilityNodeInfosByViewId("${preferences.targetPackage}:id/$idSuffix")
@@ -841,12 +1250,16 @@ class IonCaptureService : AccessibilityService() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
 
     private enum class Phase {
-        IDLE, OPEN_PLAN, CHOOSE_PLAN, OPEN_TABLE, SCAN_LIST, WAIT_DETAIL, READ_DETAIL,
+        IDLE, OPEN_PLAN, CHOOSE_PLAN, OPEN_TABLE, RESET_LIST, SCAN_LIST, WAIT_DETAIL, READ_DETAIL,
         WAIT_LIST_RETURN, RETURN_HEADER
     }
 
     companion object {
-        private val CONDITIONS = listOf(7, 14, 21, 28)
+        /**
+         * Todos os prazos que o ION oferece. A coleta pode ler só um deles, mas a
+         * tela de planos continua mostrando os quatro — é assim que ela é reconhecida.
+         */
+        private val ALL_CONDITIONS = AppPreferences.CAPTURE_DAYS
         private const val EVENT_SETTLE_MS = 220L
         private const val ACTION_SETTLE_MS = 900L
         private const val PRODUCT_OPEN_MS = 700L
@@ -862,5 +1275,9 @@ class IonCaptureService : AccessibilityService() {
         private const val REQUIRED_STABLE_PAGES = 3
         private const val REQUIRED_OUTSIDE_CHECKS = 2
         private const val VISIBILITY_CHECK_MS = 900L
+        private const val MAX_LIST_RESET_SCROLLS = 1_200
+        private const val MAX_PLAN_ATTEMPTS = 6
+        private const val DRAFT_WRITE_EVERY = 25
+        private const val DRAFT_WRITE_INTERVAL_MS = 20_000L
     }
 }

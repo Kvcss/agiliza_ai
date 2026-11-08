@@ -442,8 +442,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun buildExcelQuoteCard(): View = card("3 · Cotação Excel por caixa").apply {
-        addView(bodyText("Envie o modelo recebido. O Agiliza encontra cada produto pelo nome e preenche o valor da caixa usando somente a tabela de prazo escolhida aqui."))
+    private fun buildExcelQuoteCard(): View = card("3 · Cotação Excel por unidade").apply {
+        addView(bodyText("Envie o modelo recebido. O Agiliza encontra cada produto pelo nome e preenche o preço unitário mostrado na tabela do ION, sem multiplicar pela embalagem."))
         addView(infoPanel(
             "TRÊS PASSOS",
             "1. Selecione o Excel da cotação\n2. Escolha a base de 7, 14, 21 ou 28 dias\n3. Gere o arquivo e compartilhe"
@@ -480,7 +480,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(2), 0, dp(2), dp(2))
         })
-        addView(bodyText("Escolha qual tabela capturada será usada para calcular o preço por caixa."))
+        addView(bodyText("Escolha qual tabela capturada fornecerá o preço unitário para este Excel."))
         excelConditionGroup = RadioGroup(this@MainActivity).apply {
             orientation = RadioGroup.HORIZONTAL
             gravity = Gravity.START
@@ -509,7 +509,7 @@ class MainActivity : Activity() {
     }
 
     private fun buildPortalCard(): View = card("4 · Preencher o portal").apply {
-        addView(bodyText("Cadastre o link, o código de acesso e a senha. O app entra sozinho, encontra cada produto pelo código de barras, pelo código do produto confirmado pelo nome, e escreve o preço unitário da base escolhida para o portal."))
+        addView(bodyText("Cadastre o link e abra o portal dentro do app. Você faz o login e navega manualmente; depois o app compara os produtos e preenche somente os campos de preço. Salvar e qualquer confirmação continuam manuais."))
         addView(infoPanel(
             "CONTINUA COM A TELA BLOQUEADA",
             "O preenchimento roda em segundo plano com uma notificação de progresso. Sair do app ou bloquear o celular não interrompe mais o processo."
@@ -1047,7 +1047,7 @@ class MainActivity : Activity() {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            putExtra(Intent.EXTRA_TITLE, "cotacao_caixa_${excelConditionDays}d_$timestamp.xlsx")
+            putExtra(Intent.EXTRA_TITLE, "cotacao_unidade_${excelConditionDays}d_$timestamp.xlsx")
             addFlags(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
                     Intent.FLAG_GRANT_WRITE_URI_PERMISSION or

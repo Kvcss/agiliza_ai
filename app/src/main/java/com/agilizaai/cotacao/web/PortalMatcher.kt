@@ -22,7 +22,7 @@ object PortalMatcher {
     )
 
     /** Sinal que resolveu a linha, exibido no relatório final. */
-    enum class Signal { BARCODE, BARCODE_PREFIX, CODE, NAME }
+    enum class Signal { BARCODE, PACKAGING_CODE, BARCODE_PREFIX, CODE, NAME }
 
     data class Resolution(val rowIndex: Int, val price: String, val signal: Signal)
 
@@ -41,6 +41,7 @@ object PortalMatcher {
 
     class Index internal constructor(
         internal val byBarcode: Map<String, Entry>,
+        internal val byPackagingCode: Map<String, Entry>,
         internal val byCode: Map<String, Entry>,
         internal val byName: Map<String, Entry>,
         internal val prefixes: List<Entry>,
@@ -69,6 +70,11 @@ object PortalMatcher {
         val byBarcode = uniqueBy(usable, conflicts, "ean") { (entry, _) ->
             entry.barcode.takeIf { it.length in FULL_EAN_LENGTHS }
         }
+        // Regra do portal: no código capturado pelo app saem o primeiro e o último
+        // dígito. O código exibido pelo site é normalizado separadamente no resolve.
+        val byPackagingCode = uniqueBy(usable, conflicts, "emb") { (entry, _) ->
+            capturedPackagingCode(entry.barcode)
+        }
         val byCode = uniqueBy(usable, conflicts, "cod") { (_, item) ->
             normalizeCode(item.productCode).takeIf { it.isNotBlank() }
         }
@@ -83,6 +89,7 @@ object PortalMatcher {
 
         return Index(
             byBarcode = byBarcode,
+            byPackagingCode = byPackagingCode,
             byCode = byCode,
             byName = byName,
             prefixes = prefixes,
@@ -99,6 +106,7 @@ object PortalMatcher {
 
         rows.forEach { row ->
             val rowBarcode = row.barcode.filter(Char::isDigit)
+            val rowPackagingCode = portalPackagingCode(rowBarcode)
             val rowCode = normalizeCode(row.code)
             val rowName = normalizeName(row.description)
 
@@ -109,6 +117,16 @@ object PortalMatcher {
 
             index.byBarcode[rowBarcode]?.let {
                 resolutions += Resolution(row.index, it.price, Signal.BARCODE)
+                return@forEach
+            }
+
+            if (rowPackagingCode != null && index.conflictingKeys.contains("emb:$rowPackagingCode")) {
+                conflicting += row.index
+                return@forEach
+            }
+
+            index.byPackagingCode[rowPackagingCode]?.let {
+                resolutions += Resolution(row.index, it.price, Signal.PACKAGING_CODE)
                 return@forEach
             }
 
@@ -202,6 +220,22 @@ object PortalMatcher {
     /** O ION mostra "115.967" e o portal "051435": só os dígitos são comparáveis. */
     internal fun normalizeCode(value: String): String =
         value.filter(Char::isDigit).trimStart('0')
+
+    /** No código capturado pelo app, remove exatamente o primeiro e o último dígito. */
+    internal fun capturedPackagingCode(value: String): String? {
+        val digits = value.filter(Char::isDigit)
+        return digits.takeIf { it.length >= 3 }
+            ?.substring(1, digits.lastIndex)
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    /** No Cód. Emb. lido do site, remove exatamente o último dígito. */
+    internal fun portalPackagingCode(value: String): String? {
+        val digits = value.filter(Char::isDigit)
+        return digits.takeIf { it.length >= 2 }
+            ?.dropLast(1)
+            ?.takeIf { it.isNotBlank() }
+    }
 
     internal fun normalizeName(value: String): String = java.text.Normalizer
         .normalize(value.uppercase(), java.text.Normalizer.Form.NFD)

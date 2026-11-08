@@ -78,7 +78,7 @@ object QuoteWorkbookFiller {
                 items = eligibleItems,
                 variantPolicy = ProductNameMatcher.VariantPolicy.PREFER_SINGLE_CJ
             )
-            val price = match?.item?.casePriceForDays(conditionDays)
+            val price = match?.item?.priceForDays(conditionDays)?.toBigDecimalOrNull()
             if (price == null) {
                 unmatched++
                 return@forEach

@@ -9,10 +9,13 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -98,6 +101,8 @@ class IonCaptureService : AccessibilityService() {
     private var skippedConjunto = 0
     private var pendingDraftWrites = 0
     private var lastDraftWriteAt = 0L
+    private var previousAutoRotation: Int? = null
+    private var previousUserRotation: Int? = null
 
     private val advanceRunnable = Runnable(::advance)
     private val visibilityRunnable = object : Runnable {
@@ -338,6 +343,8 @@ class IonCaptureService : AccessibilityService() {
             return
         }
 
+        if (!forceLandscape()) return
+
         val resumeSession = pendingResumeSession()
         // A retomada não pode chamar beginNewCapture: isso promoveria o rascunho e
         // apagaria justamente os produtos que ela precisa continuar preenchendo.
@@ -475,7 +482,7 @@ class IonCaptureService : AccessibilityService() {
                 Phase.OPEN_TABLE -> openProductTable(root, nodes)
                 Phase.RESET_LIST -> resetListToTop(root, nodes)
                 Phase.SCAN_LIST -> scanProductList(root, nodes)
-                Phase.WAIT_DETAIL -> waitForDetail(nodes)
+                Phase.WAIT_DETAIL -> waitForDetail(root, nodes)
                 Phase.READ_DETAIL -> readProductDetail(nodes)
                 Phase.WAIT_LIST_RETURN -> waitForList(nodes)
                 Phase.RETURN_HEADER -> returnToHeader(root, nodes)
@@ -656,16 +663,16 @@ class IonCaptureService : AccessibilityService() {
 
         val products = IonProductReader.readList(nodes)
 
-        // Produtos em conjunto (Und: CJ) não entram na base. Descartá-los aqui evita
-        // abrir o detalhe à toa — com 3.000 itens por tabela isso economiza muito tempo.
-        val conjuntos = products.filter { it.isConjunto && visitToken(it) !in visitedInCondition }
-        if (conjuntos.isNotEmpty()) {
-            conjuntos.forEach { visitedInCondition += visitToken(it) }
-            skippedConjunto += conjuntos.size
+        // Somente Und: CX entra na base. Descartar as demais unidades ainda na lista
+        // evita abrir milhares de detalhes que nunca poderiam ser usados.
+        val nonCases = products.filter { !it.isCaseUnit && visitToken(it) !in visitedInCondition }
+        if (nonCases.isNotEmpty()) {
+            nonCases.forEach { visitedInCondition += visitToken(it) }
+            skippedConjunto += nonCases.size
             unchangedPages = 0
             pendingScrollFingerprint = null
             scrollLoadChecks = 0
-            updateOverlay("${conjuntos.size} conjunto(s) ignorado(s)", progressText())
+            updateOverlay("${nonCases.size} item(ns) fora de Und: CX", progressText())
             scheduleAdvance(150L)
             return
         }
@@ -776,12 +783,31 @@ class IonCaptureService : AccessibilityService() {
         }
     }
 
-    private fun waitForDetail(nodes: List<NodeSnapshot>) {
-        if (IonProductReader.isProductDetail(nodes)) {
-            moveTo(Phase.READ_DETAIL, DETAIL_SETTLE_MS)
-        } else {
-            retryOrAbort("O detalhe do produto não abriu")
+    private fun waitForDetail(root: AccessibilityNodeInfo, nodes: List<NodeSnapshot>) {
+        when {
+            IonProductReader.isProductDetail(nodes) -> moveTo(Phase.READ_DETAIL, DETAIL_SETTLE_MS)
+            IonProductReader.isUnavailableProductAlert(nodes) -> skipUnavailableProduct(root)
+            else -> retryOrAbort("O detalhe do produto não abriu")
         }
+    }
+
+    /** Fecha somente o alerta conhecido e garante que o produto bloqueado não seja salvo. */
+    private fun skipUnavailableProduct(root: AccessibilityNodeInfo) {
+        val product = currentProduct
+        if (product == null) {
+            abortCapture("Produto indisponível sem referência; captura interrompida", AppPreferences.CAPTURE_ABORTED)
+            return
+        }
+        if (!clickTextExact(root, "OK")) {
+            retryOrAbort("Não consegui fechar o aviso de produto indisponível")
+            return
+        }
+        visitedInCondition += visitToken(product)
+        conditionCounts[currentDays()] = visitedInCondition.size
+        currentProduct = null
+        skippedConjunto++
+        updateOverlay("Produto indisponível ignorado", progressText())
+        moveTo(Phase.WAIT_LIST_RETURN, PRODUCT_RETURN_MS)
     }
 
     private fun readProductDetail(nodes: List<NodeSnapshot>) {
@@ -815,8 +841,9 @@ class IonCaptureService : AccessibilityService() {
                 .singleOrNull()
                 ?: exactKey
         }
-        val eligibleStock = item.isEligibleForBase()
-        if (eligibleStock) {
+        val eligibleUnit = IonProductReader.isCaseUnit(item.salesUnit.ifBlank { listProduct.unit })
+        val eligibleProduct = eligibleUnit && item.isEligibleForBase()
+        if (eligibleProduct) {
             capturedItems[key] = mergeProduct(capturedItems[key], item)
             capturedIdentities[key] = capturedIdentities[key]?.mergedWith(identity) ?: identity
         } else {
@@ -833,7 +860,8 @@ class IonCaptureService : AccessibilityService() {
         currentProduct = null
         conditionCounts[currentDays()] = visitedInCondition.size
         val stockStatus = when {
-            eligibleStock -> "produto gravado · estoque ${item.stock}"
+            eligibleProduct -> "produto gravado · estoque ${item.stock}"
+            !eligibleUnit -> "ignorado · detalhe não confirmou Und: CX"
             item.isExcludedSalesUnit() -> {
                 skippedConjunto++
                 "ignorado · conjunto (Und: CJ) não entra na base"
@@ -929,6 +957,7 @@ class IonCaptureService : AccessibilityService() {
         scanning = false
         paused = false
         setCaptureScreenOn(false)
+        restoreRotation()
         handler.removeCallbacks(advanceRunnable)
         preferences.captureArmed = false
         val items = capturedItems.values.toList()
@@ -978,6 +1007,7 @@ class IonCaptureService : AccessibilityService() {
         scanning = false
         paused = false
         setCaptureScreenOn(false)
+        restoreRotation()
         phase = Phase.IDLE
         preferences.captureArmed = false
         if (preferences.captureStatus == AppPreferences.CAPTURE_IN_PROGRESS) {
@@ -1000,6 +1030,7 @@ class IonCaptureService : AccessibilityService() {
         scanning = false
         paused = false
         setCaptureScreenOn(false)
+        restoreRotation()
         preferences.captureArmed = false
         preferences.captureStatus = status
         val protectedCount = repository.load().size
@@ -1064,8 +1095,65 @@ class IonCaptureService : AccessibilityService() {
             if (days == currentDays()) "[$days]" else days.toString()
         }
         val saved = if (capturedItems.isNotEmpty()) " · ✓ salvo" else ""
-        val conjuntos = if (skippedConjunto > 0) " · $skippedConjunto CJ fora" else ""
-        return "$terms · ${visitedInCondition.size} neste prazo · ${capturedItems.size} produtos$conjuntos$saved"
+        val skipped = if (skippedConjunto > 0) " · $skippedConjunto fora/indisp." else ""
+        return "$terms · ${visitedInCondition.size} neste prazo · ${capturedItems.size} produtos$skipped$saved"
+    }
+
+    /**
+     * Trava o aparelho em paisagem para o ION expor o Cód. Emb. completo. A permissão
+     * é especial do Android; na primeira execução abrimos a tela oficial para o usuário.
+     */
+    private fun forceLandscape(): Boolean {
+        if (!Settings.System.canWrite(this)) {
+            overlayStatus?.text = "Autorize 'Modificar configurações' e inicie novamente"
+            Toast.makeText(this, "Autorize a rotação horizontal e volte ao ION", Toast.LENGTH_LONG).show()
+            runCatching {
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            return false
+        }
+        if (previousAutoRotation == null) {
+            previousAutoRotation = Settings.System.getInt(
+                contentResolver,
+                Settings.System.ACCELEROMETER_ROTATION,
+                1
+            )
+            previousUserRotation = Settings.System.getInt(
+                contentResolver,
+                Settings.System.USER_ROTATION,
+                Surface.ROTATION_0
+            )
+        }
+        val locked = Settings.System.putInt(
+            contentResolver,
+            Settings.System.ACCELEROMETER_ROTATION,
+            0
+        ) && Settings.System.putInt(
+            contentResolver,
+            Settings.System.USER_ROTATION,
+            Surface.ROTATION_90
+        )
+        if (!locked) {
+            restoreRotation()
+            overlayStatus?.text = "Não consegui colocar a tela na horizontal"
+            return false
+        }
+        return true
+    }
+
+    /** Devolve exatamente a configuração de rotação que existia antes da captura. */
+    private fun restoreRotation() {
+        val auto = previousAutoRotation ?: return
+        val rotation = previousUserRotation ?: Surface.ROTATION_0
+        if (Settings.System.canWrite(this)) {
+            Settings.System.putInt(contentResolver, Settings.System.USER_ROTATION, rotation)
+            Settings.System.putInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, auto)
+        }
+        previousAutoRotation = null
+        previousUserRotation = null
     }
 
     /**
@@ -1123,7 +1211,10 @@ class IonCaptureService : AccessibilityService() {
         if (current == null) return candidate
         fun choose(existing: String, incoming: String): String = existing.ifBlank { incoming }
         val mergedPrices = current.pricesByDays + candidate.pricesByDays
-        val mergedCasePrices = current.casePricesByDays + candidate.casePricesByDays
+        // Uma nova leitura unitária também elimina eventual preço de caixa legado
+        // daquele prazo, impedindo que ele volte a ser usado como valor capturado.
+        val mergedCasePrices = (current.casePricesByDays - candidate.pricesByDays.keys) +
+            candidate.casePricesByDays
         val primaryDays = if (7 in mergedCasePrices) 7 else {
             mergedCasePrices.keys.minOrNull() ?: candidate.conditionDays
         }

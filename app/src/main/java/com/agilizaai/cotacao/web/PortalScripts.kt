@@ -1,6 +1,5 @@
 package com.agilizaai.cotacao.web
 
-import com.agilizaai.cotacao.data.AppPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -220,45 +219,16 @@ internal object PortalScripts {
     """.trimIndent()
 
     /** Detecta se estamos no login ou já na tabela, sem alterar nada. */
-    fun probe(preferences: AppPreferences): String = wrap(
+    fun probe(): String = wrap(
         """
         const found = findTables();
         const total = found.reduce((sum, group) => sum + group.rows.length, 0);
         const tableReady = total > 0;
-        const form = tableReady ? null : findLogin(${selectors(preferences)});
+        const form = tableReady ? null : findLogin('', '', '');
         const loginReady = Boolean(form);
         return JSON.stringify({ ok: true, loginReady, tableReady, rows: total });
         """.trimIndent()
     )
-
-    fun login(preferences: AppPreferences, code: String, password: String): String = wrap(
-        """
-        const form = findLogin(${selectors(preferences)});
-        if (!form) {
-          return JSON.stringify({ ok: false, message: 'Não encontrei os campos Código e Senha na página' });
-        }
-        setValue(form.user, ${json(code)});
-        setValue(form.pass, ${json(password)});
-        // Sem botão reconhecível o formulário ainda é enviado pelo próprio elemento,
-        // que é como a página de login do portal funciona quando o Entrar é uma imagem.
-        if (form.submit) {
-          form.submit.click();
-        } else if (form.form && typeof form.form.requestSubmit === 'function') {
-          form.form.requestSubmit();
-        } else if (form.form) {
-          form.form.submit();
-        } else {
-          return JSON.stringify({ ok: false, message: 'Não encontrei o botão Entrar do portal' });
-        }
-        return JSON.stringify({ ok: true, message: 'Login enviado' });
-        """.trimIndent()
-    )
-
-    private fun selectors(preferences: AppPreferences): String = listOf(
-        preferences.loginUserSelector,
-        preferences.loginPasswordSelector,
-        preferences.loginSubmitSelector
-    ).joinToString(", ") { json(it) }
 
     /**
      * Lê código, EAN e descrição de cada linha e marca a linha com um índice estável,

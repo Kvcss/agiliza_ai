@@ -205,7 +205,7 @@ class IonProductReaderTest {
     }
 
     @Test
-    fun unitPriceUsesCaseDivisionAndListPriceOnlyAsFallback() {
+    fun unitPriceAlwaysUsesTheListPriceInsteadOfTheCaseTotal() {
         fun product(packaging: String) = IonProductReader.readList(
             listOf(
                 node("105.560", "textViewCodigoProduto", 100),
@@ -229,7 +229,8 @@ class IonProductReaderTest {
             sourcePackage = "ion"
         )!!
 
-        assertEquals("7.203333", detail(product("6"), "6,000/6,000").priceForDays(7))
+        assertEquals("12.43", detail(product("6"), "6,000/6,000").priceForDays(7))
+        assertTrue(detail(product("6"), "6,000/6,000").casePricesByDays.isEmpty())
         assertEquals("12.43", detail(product(""), "").priceForDays(7))
     }
 
@@ -323,6 +324,38 @@ class IonProductReaderTest {
             )
         ).single()
         assertFalse(unidade.isConjunto)
+    }
+
+    @Test
+    fun acceptsOnlyCxAsCaptureUnit() {
+        fun product(code: String, unit: String) = IonProductReader.readList(
+            listOf(
+                node(code, "textViewCodigoProduto", 100),
+                node("PRODUTO TESTE", "textViewDescricao", 110),
+                node("17890000000001", "textViewCodigoBarras", 130),
+                node(unit, "textViewUnidade", 130),
+                node("12", "textViewEmbalagem", 150),
+                node("10,00", "textViewPrecoTabela", 170)
+            )
+        ).single()
+
+        assertTrue(product("12.345", "CX").isCaseUnit)
+        assertTrue(product("12.346", "cx").isCaseUnit)
+        assertFalse(product("12.347", "UN").isCaseUnit)
+        assertFalse(product("12.348", "CJ").isCaseUnit)
+    }
+
+    @Test
+    fun recognizesOnlyTheKnownUnavailableProductAlert() {
+        val unavailable = listOf(
+            node("Algo deu errado ao carregar o produto", "message", 100),
+            node("Existe uma ou mais restrições de venda impedindo a venda desse produto", "detail", 130),
+            node("OK", "button1", 180)
+        )
+        val unrelated = listOf(node("Algo deu errado ao salvar o pedido", "message", 100))
+
+        assertTrue(IonProductReader.isUnavailableProductAlert(unavailable))
+        assertFalse(IonProductReader.isUnavailableProductAlert(unrelated))
     }
 
     private fun node(text: String, id: String, y: Int) = NodeSnapshot(

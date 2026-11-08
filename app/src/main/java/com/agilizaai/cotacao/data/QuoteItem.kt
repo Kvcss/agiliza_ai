@@ -36,10 +36,20 @@ data class QuoteItem(
     /** Only a value read for this exact ION payment term is authoritative. */
     fun priceForDays(days: Int): String = pricesByDays[days].orEmpty()
 
-    fun priceForWebsite(days: Int = conditionDays): String = priceForDays(days).toBigDecimalOrNull()
-        ?.setScale(2, java.math.RoundingMode.HALF_UP)
-        ?.toPlainString()
-        ?: priceForDays(days)
+    fun priceForWebsite(days: Int = conditionDays): String {
+        val raw = priceForDays(days)
+        val stored = raw.toBigDecimalOrNull() ?: return raw
+        val storedCase = casePricesByDays[days]?.toBrazilianDecimalOrNull()
+        val units = unitsPerCase.toBrazilianDecimalOrNull()?.takeIf { it > BigDecimal.ONE }
+        // Protege bases antigas nas quais o total da caixa foi gravado por engano
+        // também no campo unitário. A nova captura já não persiste esse total.
+        val unit = if (storedCase != null && units != null && stored.compareTo(storedCase) == 0) {
+            storedCase.divide(units, 6, java.math.RoundingMode.HALF_UP)
+        } else {
+            stored
+        }
+        return unit.setScale(2, java.math.RoundingMode.HALF_UP).toPlainString()
+    }
 
     fun casePriceForDays(days: Int): BigDecimal? {
         casePricesByDays[days]?.toBrazilianDecimalOrNull()?.let { return it }

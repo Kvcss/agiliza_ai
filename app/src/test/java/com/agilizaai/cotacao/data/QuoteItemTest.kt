@@ -76,6 +76,18 @@ class QuoteItemTest {
     }
 
     @Test
+    fun portalRepairsLegacyBaseThatStoredTheCaseTotalAsUnitPrice() {
+        val legacy = base(salesUnit = "CX").copy(
+            unitPrice = "34.206",
+            pricesByDays = mapOf(7 to "34.206"),
+            unitsPerCase = "6",
+            casePricesByDays = mapOf(7 to "34.206")
+        )
+
+        assertEquals("5.70", legacy.priceForWebsite(7))
+    }
+
+    @Test
     fun migratesLegacyCasePriceOnlyWithPreciseCaseSize() {
         assertEquals(
             mapOf(7 to "5.791"),

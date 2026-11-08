@@ -27,9 +27,9 @@ import com.agilizaai.cotacao.MainActivity
 import com.agilizaai.cotacao.R
 import com.agilizaai.cotacao.data.AppPreferences
 import com.agilizaai.cotacao.data.QuoteRepository
-import com.agilizaai.cotacao.security.SecureCredentialStore
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
 
 /**
  * Executa o preenchimento do portal fora do ciclo de vida da tela.
@@ -44,7 +44,7 @@ import org.json.JSONObject
 class PortalFillService : Service() {
 
     /** Fase atual, usada pela tela e pela notificação. */
-    enum class Phase { IDLE, LOADING, LOGIN, LOCATING, FILLING, DONE, FAILED }
+    enum class Phase { IDLE, LOADING, LOCATING, FILLING, DONE, FAILED }
 
     data class Progress(
         val phase: Phase = Phase.IDLE,
@@ -60,8 +60,8 @@ class PortalFillService : Service() {
         val etaSeconds: Int = -1
     ) {
         val percent: Int get() = if (total <= 0) 0 else (processed * 100 / total).coerceIn(0, 100)
-        val running: Boolean get() = phase == Phase.LOADING || phase == Phase.LOGIN ||
-            phase == Phase.LOCATING || phase == Phase.FILLING
+        val running: Boolean get() = phase == Phase.LOADING || phase == Phase.LOCATING ||
+            phase == Phase.FILLING
 
         /** Só o preenchimento tem percentual real; as outras fases são de espera. */
         val hasPercent: Boolean get() = phase == Phase.FILLING && total > 0
@@ -77,14 +77,12 @@ class PortalFillService : Service() {
     private val binder = LocalBinder()
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var preferences: AppPreferences
-    private lateinit var credentials: SecureCredentialStore
     private var wakeLock: PowerManager.WakeLock? = null
 
     private var webView: WebView? = null
     private var allowedScheme = "https"
     private var allowedHost = ""
     private var allowedPort = 443
-    private var loginAttempted = false
     private var fillStarted = false
     private var locateAttempts = 0
     private var batchStart = 0
@@ -105,7 +103,6 @@ class PortalFillService : Service() {
     override fun onCreate() {
         super.onCreate()
         preferences = AppPreferences(this)
-        credentials = SecureCredentialStore(this)
         createChannel()
     }
 
@@ -166,6 +163,17 @@ class PortalFillService : Service() {
         detachWebView()
     }
 
+    /** Abre o portal para o usuário enxergar a página e fazer o login manualmente. */
+    fun openForManualUse() {
+        val uri = PortalUrl.parse(preferences.portalUrl) ?: return
+        configureAllowedOrigin(uri)
+        val view = ensureWebView()
+        val current = view.url.orEmpty()
+        if (current.isBlank() || current == "about:blank" || !isAllowed(Uri.parse(current))) {
+            view.loadUrl(preferences.portalUrl)
+        }
+    }
+
     private fun detachWebView() {
         val view = webView ?: return
         (view.parent as? ViewGroup)?.removeView(view)
@@ -196,9 +204,7 @@ class PortalFillService : Service() {
             failBeforeStart("Configure o link do portal antes de preencher")
             return
         }
-        allowedScheme = uri.scheme.lowercase()
-        allowedHost = uri.host.lowercase()
-        allowedPort = PortalUrl.portOf(uri)
+        configureAllowedOrigin(uri)
 
         val days = preferences.portalConditionDays
         val index = PortalMatcher.buildIndex(QuoteRepository(this).load(), days)
@@ -209,7 +215,6 @@ class PortalFillService : Service() {
         usableBaseItems = index.usableItems
         portalIndex = index
 
-        loginAttempted = false
         fillStarted = false
         locateAttempts = 0
         batchStart = 0
@@ -293,7 +298,9 @@ class PortalFillService : Service() {
 
             override fun onPageFinished(v: WebView?, url: String?) {
                 super.onPageFinished(v, url)
-                if (stopping || !isAllowed(Uri.parse(url ?: ""))) return
+                // Abrir e navegar no portal é totalmente manual. Só sondamos a página
+                // depois que o usuário toca explicitamente em PREENCHER AUTOMÁTICO.
+                if (stopping || !progress.running || !isAllowed(Uri.parse(url ?: ""))) return
                 handler.postDelayed(::probe, PROBE_DELAY_MS)
             }
 
@@ -325,16 +332,27 @@ class PortalFillService : Service() {
             uri.userInfo.isNullOrBlank()
     }
 
+    private fun configureAllowedOrigin(uri: URI) {
+        allowedScheme = uri.scheme.lowercase()
+        allowedHost = uri.host.lowercase()
+        allowedPort = PortalUrl.portOf(uri)
+    }
+
     /** Descobre se a página atual é o login ou já é a tabela da cotação. */
     private fun probe() {
-        if (stopping) return
-        evaluate(PortalScripts.probe(preferences)) { result ->
+        if (stopping || !progress.running) return
+        evaluate(PortalScripts.probe()) { result ->
             if (stopping) return@evaluate
             when {
-                result.optBoolean("loginReady") && !loginAttempted -> {
-                    loginAttempted = true
-                    publish(progress.copy(phase = Phase.LOGIN, message = "Entrando no portal…"))
-                    performLogin()
+                result.optBoolean("loginReady") -> {
+                    releaseWakeLock()
+                    publish(
+                        progress.copy(
+                            phase = Phase.FAILED,
+                            message = "Faça o login manualmente e abra a tabela antes de preencher"
+                        )
+                    )
+                    stopForegroundKeepingNotification()
                 }
                 result.optBoolean("tableReady") -> {
                     if (!fillStarted) {
@@ -363,33 +381,6 @@ class PortalFillService : Service() {
                     stopForegroundKeepingNotification()
                 }
             }
-        }
-    }
-
-    private fun performLogin() {
-        val email = credentials.email()
-        val password = credentials.password()
-        val expectedOrigin = PortalUrl.origin(allowedScheme, allowedHost, allowedPort)
-        if (credentials.origin() != expectedOrigin || email.isBlank() || password.isBlank()) {
-            releaseWakeLock()
-            publish(progress.copy(phase = Phase.FAILED, message = "Cadastre o código e a senha do portal"))
-            stopForegroundKeepingNotification()
-            return
-        }
-        evaluate(PortalScripts.login(preferences, email, password)) { result ->
-            if (stopping) return@evaluate
-            if (!result.optBoolean("ok")) {
-                releaseWakeLock()
-                publish(
-                    progress.copy(
-                        phase = Phase.FAILED,
-                        message = result.optString("message", "Não consegui preencher o login")
-                    )
-                )
-                stopForegroundKeepingNotification()
-                return@evaluate
-            }
-            handler.postDelayed(::probe, LOGIN_SETTLE_MS)
         }
     }
 
@@ -487,6 +478,7 @@ class PortalFillService : Service() {
         val signals = report?.let {
             mapOf(
                 "EAN" to it.signalCount(PortalMatcher.Signal.BARCODE),
+                "Cód. Emb." to it.signalCount(PortalMatcher.Signal.PACKAGING_CODE),
                 "EAN parcial" to it.signalCount(PortalMatcher.Signal.BARCODE_PREFIX),
                 "Código" to it.signalCount(PortalMatcher.Signal.CODE),
                 "Nome" to it.signalCount(PortalMatcher.Signal.NAME)
@@ -624,7 +616,6 @@ class PortalFillService : Service() {
         private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60 * 1000L
         private const val PROBE_DELAY_MS = 600L
         private const val LOCATE_RETRY_MS = 900L
-        private const val LOGIN_SETTLE_MS = 1_500L
         private const val MAX_LOCATE_ATTEMPTS = 25
         // Lotes menores fazem a barra andar em passos visíveis em vez de saltar de
         // 0% para 100% em três atualizações, sem custo perceptível de velocidade.

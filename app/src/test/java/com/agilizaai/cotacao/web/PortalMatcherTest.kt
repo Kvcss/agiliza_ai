@@ -41,6 +41,40 @@ class PortalMatcherTest {
     }
 
     @Test
+    fun matchesPortalPackagingCodeAfterRemovingOuterDigits() {
+        val index = PortalMatcher.buildIndex(
+            listOf(item("123", "34444443", "PRODUTO EM CAIXA", "27.50")),
+            7
+        )
+        val report = PortalMatcher.resolve(
+            index,
+            listOf(PortalMatcher.Row(0, "", "4444443", "PRODUTO EM CAIXA"))
+        )
+
+        assertEquals(1, report.matched)
+        assertEquals("27.50", report.resolutions.single().price)
+        assertEquals(PortalMatcher.Signal.PACKAGING_CODE, report.resolutions.single().signal)
+    }
+
+    @Test
+    fun blocksDuplicatedPackagingCodesWithDifferentPrices() {
+        val index = PortalMatcher.buildIndex(
+            listOf(
+                item("1", "34444443", "PRODUTO A", "10.00"),
+                item("2", "24444449", "PRODUTO B", "20.00")
+            ),
+            7
+        )
+        val report = PortalMatcher.resolve(
+            index,
+            listOf(PortalMatcher.Row(0, "", "4444443", "PRODUTO"))
+        )
+
+        assertEquals(0, report.matched)
+        assertEquals(listOf(0), report.conflicting)
+    }
+
+    @Test
     fun refusesATruncatedBarcodeWhenTheNameIsADifferentProduct() {
         val index = PortalMatcher.buildIndex(
             listOf(item("116068", "006192058019", "*EXPOSITOR HAVAIANAS 10 GANCHOS(120 PARES)", "364.17")),

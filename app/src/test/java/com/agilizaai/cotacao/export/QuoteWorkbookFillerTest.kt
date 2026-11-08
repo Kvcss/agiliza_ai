@@ -15,7 +15,7 @@ import javax.xml.parsers.DocumentBuilderFactory
 
 class QuoteWorkbookFillerTest {
     @Test
-    fun renamesNomeHeaderAndFillsOnlyThatColumnWithCapturedCasePrice() {
+    fun renamesNomeHeaderAndFillsOnlyThatColumnWithCapturedUnitPrice() {
         val output = ByteArrayOutputStream()
         val result = QuoteWorkbookFiller.fill(
             input = ByteArrayInputStream(workbook()),
@@ -50,7 +50,7 @@ class QuoteWorkbookFillerTest {
             "right",
             (priceStyle.getElementsByTagNameNS("*", "alignment").item(0) as Element).getAttribute("horizontal")
         )
-        assertTrue(cell(sheet, "H3").contains("<v>34.206</v>"))
+        assertTrue(cell(sheet, "H3").contains("<v>5.701</v>"))
         assertFalse(cell(sheet, "H3").contains("<v>205.236</v>"))
         assertTrue("<v>" !in cell(sheet, "H4"))
         assertEquals(4, styleIndex(cell(sheet, "H4")))
@@ -109,8 +109,8 @@ class QuoteWorkbookFillerTest {
 
         assertEquals(1, result.matched)
         assertTrue(cell(sheet, "E3").contains("<v>24</v>"))
-        assertTrue(cell(sheet, "H3").contains("<v>34.206</v>"))
-        assertFalse(cell(sheet, "H3").contains("138.984"))
+        assertTrue(cell(sheet, "H3").contains("<v>5.701</v>"))
+        assertFalse(cell(sheet, "H3").contains("5.791"))
     }
 
     @Test
@@ -153,7 +153,7 @@ class QuoteWorkbookFillerTest {
 
         val threshold = fill("3")
         assertEquals(1, threshold.first.matched)
-        assertTrue(cell(threshold.second, "H3").contains("<v>34.206</v>"))
+        assertTrue(cell(threshold.second, "H3").contains("<v>5.701</v>"))
     }
 
     @Test
@@ -178,7 +178,7 @@ class QuoteWorkbookFillerTest {
         val result = QuoteWorkbookFiller.fill(
             input = ByteArrayInputStream(workbook()),
             output = output,
-            items = listOf(item("CHÁ CHIMARRÃO GAÚCHO 500G", "10", "12")),
+            items = listOf(item("CHÁ CHIMARRÃO GAÚCHO 500G", "10", "12", unitPrice = "10")),
             conditionDays = 21,
             supplierName = "Vila Nova"
         )
@@ -212,7 +212,7 @@ class QuoteWorkbookFillerTest {
         assertEquals("Cotaçao", result.targetSheet)
         assertEquals("H", result.targetColumn)
         assertTrue(cell(sheet, "H1706").contains("<t>Vila</t>"))
-        assertTrue(cell(sheet, "H1707").contains("<v>34.206</v>"))
+        assertTrue(cell(sheet, "H1707").contains("<v>5.701</v>"))
         assertTrue(cell(sheet, "R1706").contains("<v>4</v>"))
         assertTrue(cell(sheet, "R1707").contains("<v>888</v>"))
     }

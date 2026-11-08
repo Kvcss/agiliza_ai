@@ -24,7 +24,7 @@ object XlsxExporter {
         val exportedDays = conditionDays?.let(::listOf) ?: REQUIRED_DAYS
         val stockEligibleItems = items.filter(QuoteItem::hasMinimumStock)
         val exportedItems = conditionDays?.let { days ->
-            stockEligibleItems.filter { item -> item.casePriceForDays(days) != null }
+            stockEligibleItems.filter { item -> item.priceForDays(days).toBigDecimalOrNull() != null }
         } ?: stockEligibleItems
         ZipOutputStream(output.buffered()).use { zip ->
             zip.add("[Content_Types].xml", contentTypes())
@@ -47,7 +47,7 @@ object XlsxExporter {
         val headers = buildList {
             add("Produto")
             add("EAN")
-            exportedDays.forEach { add("Preço por caixa – $it dias") }
+            exportedDays.forEach { add("Preço unitário – $it dias") }
             addAll(
                 listOf(
                     "Unidade de venda",
@@ -67,7 +67,7 @@ object XlsxExporter {
                     add(Cell.Text(item.barcode))
                     exportedDays.forEach { days ->
                         add(
-                            item.casePriceForDays(days)
+                            item.priceForDays(days).toBigDecimalOrNull()
                                 ?.let { Cell.Number(it.toPlainString(), THREE_DECIMAL_STYLE) }
                                 ?: Cell.Text("")
                         )
@@ -110,15 +110,16 @@ object XlsxExporter {
 
     private fun pendingSheet(items: List<QuoteItem>, exportedDays: List<Int>): String {
         val pending = items.filter { item ->
-            item.barcode.isBlank() || item.description.isBlank() || exportedDays.any { item.casePriceForDays(it) == null }
+            item.barcode.isBlank() || item.description.isBlank() ||
+                exportedDays.any { item.priceForDays(it).toBigDecimalOrNull() == null }
         }
         val rows = buildString {
             append(row(1, listOf("Motivo", "Código", "Código de barras", "Descrição", "Dados lidos").map { Cell.Text(it, HEADER_STYLE) }))
             pending.forEachIndexed { index, item ->
                 val reasons = buildList {
                     if (item.barcode.isBlank()) add("sem código de barras")
-                    val missingDays = exportedDays.filter { item.casePriceForDays(it) == null }
-                    if (missingDays.isNotEmpty()) add("sem preço por caixa: ${missingDays.joinToString("/")} dias")
+                    val missingDays = exportedDays.filter { item.priceForDays(it).toBigDecimalOrNull() == null }
+                    if (missingDays.isNotEmpty()) add("sem preço unitário: ${missingDays.joinToString("/")} dias")
                     if (item.description.isBlank()) add("sem descrição")
                 }.joinToString(", ")
                 append(
@@ -152,10 +153,11 @@ object XlsxExporter {
         conditionDays: Int?
     ): String {
         val conditionSummary = exportedDays.joinToString(", ") { days ->
-            "$days dias: ${items.count { it.casePriceForDays(days) != null }}"
+            "$days dias: ${items.count { it.priceForDays(days).toBigDecimalOrNull() != null }}"
         }
         val pending = items.count { item ->
-            item.barcode.isBlank() || item.description.isBlank() || exportedDays.any { item.casePriceForDays(it) == null }
+            item.barcode.isBlank() || item.description.isBlank() ||
+                exportedDays.any { item.priceForDays(it).toBigDecimalOrNull() == null }
         }
         val source = items.map { it.sourcePackage }.filter { it.isNotBlank() }.distinct().joinToString(", ")
         val metadata = listOf(
@@ -168,7 +170,7 @@ object XlsxExporter {
             "Fornecedor" to supplierName,
             "Origem" to source,
             "Regra de estoque" to "Somente estoque numérico maior ou igual a 3; ausente/ilegível é excluído.",
-            "Regra do preço" to "Preço por caixa é o Pço Tabela/Valor lido no detalhe; não há nova multiplicação.",
+            "Regra do preço" to "Preço unitário é o campo Preço lido diretamente na linha da tabela do ION; sem multiplicação pela embalagem.",
             "Regra dos prazos" to "Preços lidos diretamente no ION; sem cálculo de juros.",
             "Observação" to "Revise os valores antes de enviar a cotação."
         )

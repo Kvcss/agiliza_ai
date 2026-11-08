@@ -197,12 +197,12 @@ class XlsxExporterTest {
             barcode = "7891234567890",
             description = "Produto $id",
             quantity = "6",
-            unitPrice = "34.206",
+            unitPrice = "13.900",
             rawCells = emptyList(),
-            pricesByDays = mapOf(7 to "34.206"),
-            unitsPerCase = "6",
+            pricesByDays = mapOf(7 to "13.900"),
+            unitsPerCase = "12",
             stock = stock,
-            casePricesByDays = mapOf(7 to "34.206"),
+            casePricesByDays = mapOf(7 to "166.800"),
             salesUnit = "CJ"
         )
         XlsxExporter.write(
@@ -230,14 +230,14 @@ class XlsxExporterTest {
         }
 
         assertTrue(table.contains(">Estoque<"))
-        assertTrue(table.contains("Preço por caixa – 7 dias"))
+        assertTrue(table.contains("Preço unitário – 7 dias"))
         assertTrue(table.contains("Unidade de venda"))
         assertTrue(table.contains("Unidades por caixa"))
         assertTrue(table.contains("Código do produto"))
         assertFalse(table.contains(">Embalagem<"))
         assertFalse(table.contains(">Qtd caixa<"))
-        assertTrue(table.contains("<v>34.206</v>"))
-        assertFalse(table.contains("<v>205.236</v>"))
+        assertTrue(table.contains("<v>13.900</v>"))
+        assertFalse(table.contains("<v>166.800</v>"))
         assertTrue(table.contains("Produto estoque-tres"))
         assertTrue(table.contains("Produto estoque-alto"))
         assertFalse(table.contains("Produto estoque-baixo"))

@@ -1,6 +1,6 @@
 # Agiliza Cotação — MVP Android
 
-Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, gerar um Excel de preços, preencher um modelo de cotação por caixa e auxiliar o preenchimento de um portal.
+Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, gerar um Excel de preços unitários, preencher um modelo de cotação e auxiliar o preenchimento de um portal.
 
 ## O que já funciona
 
@@ -19,10 +19,10 @@ Aplicativo Android nativo para capturar as quatro tabelas reais do ION Vendas, g
 - O EAN completo é lido no detalhe do produto quando a lista o mostra cortado (`006192058019…`).
 - Sobreposição com prazo atual, quantidade lida, total de produtos e comandos de pausar/fechar. Ela só existe durante uma sessão de captura e é removida ao concluir, cancelar ou fechar o Agiliza.
 - Exportação `.xlsx` com as abas `Cotação`, `Pendências` e `Metadados`.
-- Colunas identificadas com os preços por caixa efetivamente lidos em 7, 14, 21 e 28 dias, unidade de venda, unidades por caixa e estoque.
+- Colunas identificadas com os preços unitários efetivamente lidos em 7, 14, 21 e 28 dias, unidade de venda, unidades por caixa e estoque.
 - Somente produtos com estoque numérico maior ou igual a 3 entram na base; estoque menor, ausente ou ilegível é descartado.
-- O preço gravado na base é o **valor unitário** (`Pço Tabela` dividido pelo tamanho confirmado da caixa). É esse valor que vai para o portal.
-- Modalidade **Preencher modelo Excel por caixa**: preserva o arquivo original, renomeia exclusivamente o cabeçalho `nome` para `Vila`, cruza nomes de forma conservadora, prioriza a variante comercial `CJ` e grava o `Pço Tabela` diretamente, sem multiplicação adicional. Produtos não encontrados ou ambíguos ficam sem preenchimento.
+- O preço gravado na base é exclusivamente o **Preço unitário** mostrado na lista do ION. O valor total da caixa exibido no detalhe não é salvo nem enviado ao portal.
+- Modalidade **Preencher modelo Excel**: preserva o arquivo original, renomeia exclusivamente o cabeçalho `nome` para `Vila`, cruza nomes de forma conservadora e grava o preço unitário da lista, sem multiplicar pela embalagem. Produtos não encontrados ou ambíguos ficam sem preenchimento.
 - O modelo escolhido é validado antes da geração. A tela confirma nome, tamanho, aba e célula do cabeçalho `nome`; uma cópia errada ou já preenchida é recusada sem tocar nas demais colunas.
 - Portal dentro de WebView restrito ao **esquema, host e porta** configurados. `https` é o preferido, mas portais internos em `http://IP:porta` (o caso do VR Cotação) são aceitos — a tela avisa, antes de guardar a senha, que a conexão não é criptografada.
 - O formulário de login é encontrado pela **estrutura da página**, com âncora no campo de senha visível: funciona com os rótulos **Código / Senha / Entrar** do VR Cotação, que não casam com seletores pensados para e-mail. Os seletores CSS continuam existindo como primeira tentativa.
@@ -53,11 +53,11 @@ Uma coleta real chega a ~3.000 produtos por tabela. Três mudanças evitam o tra
 3. Em cada modalidade, escolha qual base capturada será usada: **7, 14, 21 ou 28 dias**. O fornecedor do modelo Excel é fixo como **Vila Nova**.
 4. Em **Nova coleta no ION**, escolha como capturar: **sequencial** (os quatro prazos) ou **somente uma categoria** e qual prazo. Depois toque no botão de iniciar.
 5. No ION, siga: **Clientes > qualquer cliente > carrinho > Novo Pedido** e permaneça na aba **Cabeçalho**.
-6. Na sobreposição do Agiliza, toque no botão de captura (o rótulo mostra o plano escolhido) e aguarde. Não interaja com o ION durante a execução.
+6. Na sobreposição do Agiliza, toque no botão de captura (o rótulo mostra o plano escolhido) e aguarde. Na primeira vez, autorize **Modificar configurações do sistema** para o app travar a tela na horizontal; volte ao ION e inicie novamente. A captura considera somente itens com **Und: CX**, ignora produtos indisponíveis e restaura sua configuração de rotação ao terminar. Não interaja com o ION durante a execução.
    - Se a coleta anterior tiver sido interrompida, a tela inicial mostra o painel **Coleta interrompida** com o prazo e a quantidade já lida. Toque em **Retomar** para continuar daquele ponto em vez de recomeçar.
 7. Volte ao Agiliza, revise as linhas e exporte o Excel.
 8. Para a nova modalidade, toque em **Selecionar Excel da cotação** e depois em **Gerar Excel preenchido**.
-9. Para o portal, informe o link da tela de login (ex.: `http://177.94.206.10:8081/php/vrcotacao/login.php`), o **código de acesso** e a senha em **Configurar portal**, e escolha a base de preços. Depois toque em **Abrir e preencher portal** e em **Preencher automático**: o app entra sozinho, localiza a tabela e preenche a coluna Custo. Pode bloquear a tela — ele continua. Ao terminar, revise os campos e toque em **Salvar** no próprio portal.
+9. Para o portal, informe apenas o link da tela de login (ex.: `http://177.94.206.10:8081/php/vrcotacao/login.php`) e escolha a base de preços. Toque em **Abrir e preencher portal**, faça o login e navegue até a tabela manualmente. Só então toque em **Preencher automático**: o app compara a base e escreve apenas a coluna Custo. Ele nunca entra, confirma opções ou salva por você. Ao terminar, revise os campos e toque em **Salvar** no próprio portal.
 
 ## Compilar
 

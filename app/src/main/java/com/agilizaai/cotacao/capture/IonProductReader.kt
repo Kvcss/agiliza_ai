@@ -56,6 +56,9 @@ object IonProductReader {
          * de um produto que seria descartado, economizando milhares de toques.
          */
         val isConjunto: Boolean get() = isConjuntoUnit(unit) || isConjuntoUnit(packaging)
+
+        /** A captura comercial aceita somente linhas cuja unidade de venda é caixa. */
+        val isCaseUnit: Boolean get() = IonProductReader.isCaseUnit(unit)
     }
 
     /**
@@ -212,7 +215,6 @@ object IonProductReader {
             .toBrazilianDecimalOrNull()
             ?.toPlainString()
             .orEmpty()
-        if (casePrice.isBlank()) return null
 
         val code = nodes.value(ID_CODE).ifBlank { listProduct.productCode }
         val description = nodes.value(ID_DETAIL_DESCRIPTION)
@@ -231,16 +233,19 @@ object IonProductReader {
         val barcode = mergeBarcode(listProduct, detailBarcode)
         val barcodeTruncated = barcode.isNotBlank() && barcode == listProduct.barcode &&
             listProduct.barcodeTruncated && detailBarcode.isBlank()
-        // Pço Tabela/Valor is the authoritative sale-package price. Dividing it by the
-        // confirmed case size keeps Valor Un. consistent with the selected payment term.
-        // The list's Preço is used only when ION does not expose a valid case size.
+        // A base e o portal usam exclusivamente o Preço unitário mostrado na lista.
+        // O valor total exibido no detalhe nunca pode substituir esse preço. A divisão
+        // abaixo existe apenas como contingência para versões do ION que não exponham
+        // o preço da lista (o leitor atual normalmente já exige esse campo).
         val derivedUnitPrice = casePrice.toBrazilianDecimalOrNull()?.let { total ->
             unitsPerCase.toBrazilianDecimalOrNull()
                 ?.takeIf { it > java.math.BigDecimal.ZERO }
                 ?.let { units -> total.divide(units, 6, java.math.RoundingMode.HALF_UP) }
         }
-        val normalizedUnitPrice = derivedUnitPrice?.stripTrailingZeros()?.toPlainString()
-            ?: listProduct.unitPrice.toBrazilianDecimalOrNull()?.toPlainString().orEmpty()
+        val normalizedUnitPrice = listProduct.unitPrice.toBrazilianDecimalOrNull()
+            ?.stripTrailingZeros()
+            ?.toPlainString()
+            ?: derivedUnitPrice?.stripTrailingZeros()?.toPlainString().orEmpty()
         if (normalizedUnitPrice.isBlank()) return null
         // The detail value is authoritative. The list value is only a fallback for ION
         // builds that do not expose textViewProdutoEstoque in the accessibility tree.
@@ -278,7 +283,8 @@ object IonProductReader {
             pricesByDays = mapOf(conditionDays to normalizedUnitPrice),
             unitsPerCase = unitsPerCase,
             stock = stock,
-            casePricesByDays = mapOf(conditionDays to casePrice),
+            // Não persiste preço de caixa: a captura guarda somente o preço unitário.
+            casePricesByDays = emptyMap(),
             salesUnit = salesUnit
         )
     }
@@ -288,6 +294,15 @@ object IonProductReader {
 
     fun isProductDetail(nodes: List<NodeSnapshot>): Boolean =
         nodes.any { it.hasId(ID_DETAIL_PRICE) } || nodes.any { it.hasId(ID_DETAIL_CASE) }
+
+    /** Alerta do ION para produtos bloqueados ou indisponíveis para venda. */
+    fun isUnavailableProductAlert(nodes: List<NodeSnapshot>): Boolean {
+        val text = normalizeName(nodes.joinToString(" ") { it.text })
+        return text.contains("ALGO DEU ERRADO AO CARREGAR O PRODUTO") &&
+            (text.contains("RESTRICOES DE VENDA") || text.contains("IMPEDINDO A VENDA"))
+    }
+
+    fun isCaseUnit(value: String): Boolean = normalizeName(value) == "CX"
 
     /**
      * Chave de retomada de um produto.

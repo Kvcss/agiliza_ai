@@ -78,6 +78,7 @@ class PortalActivity : Activity() {
             service = local
             bound = true
             local.addListener(listener)
+            local.openForManualUse()
             attachWebView(local)
         }
 
@@ -169,7 +170,7 @@ class PortalActivity : Activity() {
         actions.addView(stopAction, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
         root.addView(actions)
         root.addView(TextView(this).apply {
-            text = "Revise os valores e toque em Salvar no próprio portal. O aplicativo nunca envia a cotação por você."
+            text = "Faça o login e navegue manualmente. O app só preenche preços; Salvar e qualquer confirmação ficam com você."
             setTextColor(color(R.color.muted))
             textSize = 11f
             gravity = Gravity.CENTER
@@ -237,7 +238,7 @@ class PortalActivity : Activity() {
         )
 
         detail = TextView(this).apply {
-            text = "O preenchimento continua mesmo com a tela bloqueada."
+            text = "Faça o login manualmente e abra a tabela antes de preencher."
             setTextColor(Color.rgb(170, 190, 218))
             textSize = 12f
             setPadding(0, dp(8), 0, 0)
@@ -407,7 +408,6 @@ class PortalActivity : Activity() {
                 append(
                     when (update.phase) {
                         PortalFillService.Phase.LOADING -> "Abrindo a página do portal"
-                        PortalFillService.Phase.LOGIN -> "Enviando código e senha"
                         else -> "Procurando a tabela da cotação"
                     }
                 )
@@ -458,7 +458,6 @@ class PortalActivity : Activity() {
         /** Etapas mostradas em sequência, na ordem em que o serviço passa por elas. */
         val STEPS = listOf(
             PortalFillService.Phase.LOADING to "ABRIR",
-            PortalFillService.Phase.LOGIN to "ENTRAR",
             PortalFillService.Phase.LOCATING to "LOCALIZAR",
             PortalFillService.Phase.FILLING to "PREENCHER"
         )
